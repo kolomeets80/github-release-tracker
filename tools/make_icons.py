@@ -61,10 +61,10 @@ def i_refresh(d, N, P, W):
     d.polygon([(px + tx * h, py + ty * h), (px + nx * w, py + ny * w), (px - nx * w, py - ny * w)], fill=255)
 
 
-def i_eye(d, N, P, W):
-    d.ellipse([.06 * N, .27 * N, .94 * N, .73 * N], outline=255, width=W(.11))
-    c, r = .5 * N, .14 * N
-    d.ellipse([c - r, c - r, c + r, c + r], fill=255)
+def i_check(d, N, P, W):
+    """A checkbox with a tick (Mark as seen)."""
+    d.rounded_rectangle([.1 * N, .1 * N, .9 * N, .9 * N], radius=.14 * N, outline=255, width=W(.1))
+    d.line([P(.28, .52), P(.44, .68), P(.72, .34)], fill=255, width=W(.11), joint="curve")
 
 
 def i_ext(d, N, P, W):
@@ -133,7 +133,7 @@ def i_pencil(d, N, P, W):
     d.polygon([P(.2, .66), P(.34, .8), P(.1, .9)], fill=255)                        # tip
 
 
-ICONS = {"refresh": i_refresh, "eye": i_eye, "ext": i_ext, "trash": i_trash, "gear": i_gear, "plus": i_plus,
+ICONS = {"refresh": i_refresh, "check": i_check, "ext": i_ext, "trash": i_trash, "gear": i_gear, "plus": i_plus,
          "moon": i_moon, "sun": i_sun, "import": i_import, "export": i_export, "pencil": i_pencil}
 SIZES = (16, 24)
 

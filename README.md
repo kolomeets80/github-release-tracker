@@ -14,11 +14,11 @@ A small, portable Windows app that tracks the latest release of the GitHub proje
 - See the project name, repository, current release, publish date and status at a glance
 - **Check for updates** refreshes every project; a project with a newer release is highlighted as `Update available: v1.0 -> v1.1`
 - **Mark as seen** clears the highlight once you have dealt with an update
-- Double-click a project to open its release page in your browser
-- **Rename a project** to something readable: hover a row and click the pencil (or press **F2**, or right-click > Rename). *Reset name* brings the GitHub name back. Your names are saved and included in Export
+- Double-click a project to open its release page in your browser (double-clicking the **Project** name renames it instead)
+- **Rename a project** to something readable: hover a row and click the pencil (or double-click the name, press **F2**, or right-click > Rename). *Reset name* brings the GitHub name back. Your names are saved and included in Export
 - Click the **Project**, **Repository**, **Published** or **Status** header to sort (click again to reverse; an arrow shows the direction)
 - **Import / Export** your project list as a `.json` file (merge or replace on import)
-- **Light / dark** mode: click the moon / sun button (starts with your Windows theme)
+- **Light / dark** mode: click the moon / sun icon at the bottom right (starts with your Windows theme)
 - Columns resize in proportion when you stretch or shrink the window (drag a column border to change the proportions)
 - Small icons on the buttons, thin separator lines between rows and columns, and the app's own icon
 - Version number in the window title; **Settings > About** shows it too

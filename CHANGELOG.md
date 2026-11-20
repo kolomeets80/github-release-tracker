@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0]
+- Double-click a project **name** to rename it (same as the pencil). Double-clicking any other column still opens the release page.
+- "Mark as seen" now has a checkbox icon.
+- The dark / light button moved to the bottom right (icon only). The status bar says "Dark mode." or "Light mode." when you switch.
+- Resizing the window does less work: the row lines are no longer re-placed when only the width changes, and the separator lines are redrawn once after a burst of resize events. (Not benchmarked on Windows; please report if the list still feels slow.)
+- Brought in line with the Rust edition 2.0.0 (<https://github.com/santosasarno-code/github-release-tracker-rs>); both read and write the same `projects.json`.
+
 ## [1.1.1]
 - Thin separator lines between columns, in the same colour as the row lines.
 - Column headers are left-aligned and bold.

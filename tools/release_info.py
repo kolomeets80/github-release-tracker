@@ -1,8 +1,11 @@
 """Release helper used by build.bat (standard library only).
 
     python tools/release_info.py version              print APP_VERSION (checks it looks like 1.2.3)
-    python tools/release_info.py notes <path-to-exe>  write dist/release-notes-vX.Y.Z.md with the SHA-256
-                                                      and this version's section from CHANGELOG.md
+    python tools/release_info.py notes <path-to-exe> [--run-url URL]
+                                                      write release-notes-vX.Y.Z.md next to the exe with the
+                                                      SHA-256 and this version's section from CHANGELOG.md.
+                                                      With --run-url (used by the GitHub workflow) the notes say
+                                                      the exe was built by GitHub Actions and link to that run.
 """
 import hashlib
 import os
@@ -36,7 +39,14 @@ def changelog_section(version):
     return m.group(1).strip() if m else ""
 
 
-def write_notes(exe):
+def built_by(run_url):
+    if run_url:
+        return ("This `.exe` was built by GitHub Actions (the \"Build Windows exe\" workflow) on a GitHub-hosted Windows machine "
+                "from the source in this repository. Public build log of this exact run: %s" % run_url)
+    return "This `.exe` was built by the author on their own PC with `build.bat` from the source in this repository."
+
+
+def write_notes(exe, run_url=None):
     version = read_version()
     if not os.path.isfile(exe):
         sys.exit("ERROR: %s not found" % exe)
@@ -57,7 +67,7 @@ def write_notes(exe):
              "",
              "In PowerShell: `Get-FileHash .\\GitHubReleaseTracker.exe -Algorithm SHA256`",
              "",
-             "This `.exe` was built by the author on their own PC with `build.bat` from the source in this repository.",
+             built_by(run_url),
              ""]
     with open(out, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(body))
@@ -68,8 +78,13 @@ def write_notes(exe):
 def main():
     if len(sys.argv) == 2 and sys.argv[1] == "version":
         print(read_version())
-    elif len(sys.argv) == 3 and sys.argv[1] == "notes":
-        write_notes(sys.argv[2])
+    elif len(sys.argv) in (3, 5) and sys.argv[1] == "notes":
+        url = None
+        if len(sys.argv) == 5:
+            if sys.argv[3] != "--run-url" or not sys.argv[4].startswith("https://github.com/"):
+                sys.exit("ERROR: --run-url must be followed by an https://github.com/ link")
+            url = sys.argv[4]
+        write_notes(sys.argv[2], url)
     else:
         sys.exit(__doc__)
 

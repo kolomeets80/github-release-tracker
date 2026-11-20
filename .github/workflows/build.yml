@@ -1,12 +1,12 @@
 name: Build Windows exe
 
-# OPTIONAL and MANUAL ONLY. Releases are built by hand with build.bat (see RELEASING.md) and the
-# SHA-256 in each release's notes belongs to that hand-built file. This workflow therefore never
-# runs by itself and never touches a Release: publishing a release or pushing a tag does nothing here.
-#
-# Use it only if you want a second, independent build made on GitHub's own Windows runner:
+# MANUAL ONLY. This workflow never runs by itself and never touches a Release: publishing a release
+# or pushing a tag does nothing here. You start it, download the result, and attach it to the Release
+# yourself (RELEASING.md). Building on GitHub's own Windows runner means the public run log shows
+# exactly how the exe was made. Start it like this:
 #   Actions tab -> "Build Windows exe" -> Run workflow
-#   -> the exe and its checksum are kept as a downloadable build artifact (not attached to a Release).
+#   -> the exe, its checksum and ready-to-paste release notes are kept as a downloadable build
+#      artifact (they are NOT attached to a Release: you do that by hand, see RELEASING.md).
 
 on:
   workflow_dispatch:
@@ -50,11 +50,15 @@ jobs:
           Set-Content -Path "dist/GitHubReleaseTracker.exe.sha256" -Value "$hash  GitHubReleaseTracker.exe" -Encoding ascii
           Write-Host "SHA-256: $hash  ($size bytes)"
 
-      - name: Keep the exe and checksum as a build artifact
+      - name: Write the release notes (hash, changelog, link to this run)
+        run: python tools/release_info.py notes dist/GitHubReleaseTracker.exe --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Keep the exe, checksum and release notes as a build artifact
         uses: actions/upload-artifact@v4
         with:
           name: GitHubReleaseTracker-windows
           path: |
             dist/GitHubReleaseTracker.exe
             dist/GitHubReleaseTracker.exe.sha256
+            dist/release-notes-v*.md
           if-no-files-found: error

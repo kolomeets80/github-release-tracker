@@ -14,11 +14,11 @@ Aplikasi Windows portable berukuran kecil untuk memantau release terbaru dari pr
 - Lihat nama proyek, repository, release saat ini, tanggal rilis, dan status sekilas
 - **Check for updates** menyegarkan semua proyek; proyek dengan release lebih baru disorot sebagai `Update available: v1.0 -> v1.1`
 - **Mark as seen** menghapus sorotan setelah Anda selesai menangani update
-- Klik dua kali pada proyek untuk membuka halaman release-nya di browser
-- **Ganti nama proyek** agar mudah dibaca: arahkan kursor ke baris lalu klik pensil (atau tekan **F2**, atau klik kanan > Rename). *Reset name* mengembalikan nama dari GitHub. Nama buatan Anda tersimpan dan ikut di Export
+- Klik dua kali pada proyek untuk membuka halaman release-nya di browser (klik dua kali pada nama di kolom **Project** akan me-rename)
+- **Ganti nama proyek** agar mudah dibaca: arahkan kursor ke baris lalu klik pensil (atau klik dua kali pada nama, tekan **F2**, atau klik kanan > Rename). *Reset name* mengembalikan nama dari GitHub. Nama buatan Anda tersimpan dan ikut di Export
 - Klik header **Project**, **Repository**, **Published**, atau **Status** untuk mengurutkan (klik lagi untuk membalik; panah menunjukkan arahnya)
 - **Import / Export** daftar proyek sebagai file `.json` (gabungkan atau ganti saat import)
-- Mode **terang / gelap**: klik tombol bulan / matahari (awalnya mengikuti tema Windows Anda)
+- Mode **terang / gelap**: klik ikon bulan / matahari di kanan bawah (awalnya mengikuti tema Windows Anda)
 - Semua kolom ikut melebar atau menyempit secara proporsional saat jendela diubah ukurannya (seret batas kolom untuk mengubah proporsinya)
 - Ikon kecil pada tombol, garis pemisah tipis antar baris dan kolom, dan ikon aplikasi sendiri
 - Nomor versi di judul jendela; **Settings > About** juga menampilkannya

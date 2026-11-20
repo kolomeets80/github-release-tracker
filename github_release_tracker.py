@@ -16,9 +16,9 @@ How it works
 - "Mark as seen" acknowledges the current release (clears the highlight).
 - The app never downloads or installs anything; it opens the release page.
 - "Import" / "Export" read and write a .json file (merge or replace on import).
-- The moon / sun button toggles the dark / light theme; the choice is remembered.
-- Hover a row and click the pencil (or press F2, or right-click > Rename) to give a
-  project your own display name. Reset name brings the GitHub name back.
+- The moon / sun icon (bottom right) toggles the dark / light theme; the choice is remembered.
+- Hover a row and click the pencil (or double-click the name, press F2, or right-click >
+  Rename) to give a project your own display name. Reset name brings the GitHub name back.
 
 Portable: no installer, no registry writes. Data lives in projects.json next to
 the .exe (or this script). Only if that folder is read-only does the app fall
@@ -51,7 +51,7 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "GitHub Release Tracker"
 # Keep in step with the release tag: tag v1.1.1 <-> APP_VERSION "1.1.1" (build.bat checks the format).
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 APP_ID = "santosasarno-code.GitHubReleaseTracker"  # Windows taskbar identity (so the taskbar shows our icon)
 REPO_URL = "https://github.com/santosasarno-code/github-release-tracker"
 NO_DESCRIPTION = "No description, website, or topics provided."  # same wording GitHub shows for an empty About box
@@ -76,15 +76,18 @@ ICON_MASKS = {
             "j0dYvDBjj0cckU4EAAARF2gZ"
         ),
     },
-    "eye": {
+    "check": {
         16: (
-            "eNpjYCAIGJlZWJhBmBHMZUbIgJhMDAwm+TPXrp2ZbwLiMDEEXPwPBRcDgNz0/x973Xf9/r3Lvffj/3QGga9X+Bk0/wGBJgP/"
-            "la8C6Hx09RjmodmH4R4M9+IHADTyQCU="
+            "eNpjYGRAAoxAyOkfCwExgbwMjIy8p/7DwRVhRobA/7kGxgYGBobGxsn/kxgY4v+qwnSL/C1gYIj5b8TMxszMxrBossr/PAaG"
+            "2P+GQFNYGIr+H1b9nw/iazPwMjJ4/7/HJw2Sj/uvvfwsm+qHL8YM6hD1Ov3/95z/H8TAqAzixwD1T/3/v46Bg0n1fy7IPg0G"
+            "hroWkH2SIPuC/yepqIuKqiirKof9T2FgFLyKcO9dcUZGBoH43DwwyE0UBXsQxb8AExtTrQ=="
         ),
         24: (
-            "eNpjYKALYGRmAQNmRmRBFiYEh4kFJsUMxBIOaQ39/Q1pDhJQARDJmbz9zX8oeLM9mRMswczgdx0k8PPH798/foJY1/2AgswM"
-            "mUDm1amRTT///v3ZFDn1KpCbCRTW/f//URgbA+uT/3///n/CysAW9uj/f10GhpZ/v8wZWFmi///+D0TRLKwM5r/+teAWx2EO"
-            "TntxuBOnv3CGA85wwxnOtAQAc0yQHQ=="
+            "eNp1krFOwzAQhv+znSbQjQmJhVcAFYTEezAgARIsLDDAIzCwsCJlSOdQnAim0qTqwFSpCwsLM2LoBlNVUHo4TdKmEXySB38+"
+            "3dl3BkCqAuEfaLroyPWaMzz3WKYHwnrkCh1HkMIh/wyiOMqJo/6Yz6EUvGSwmL2XBJAKTW5DiQwJ2ORz7mMSWaSglVMgLHyE"
+            "zJtiIbec+5IX6ZUtXDO/Oq25V2m4wgFP3lfLebBBRu+Mk9EWoAvfpb3vW2DtY8L7sOf+aWnIfFMfMF/BkqV4bJqDNzZ7RSVv"
+            "8je+TF9els21Sj5GDbufPFxP3yERFL5Nlo2Gu42alLIm7nKf9Bf71s36dsLjng50+BBqQ6C7I7409YXdqc7luW7qE6wzXwcz"
+            "tH/h5AP+c+7TfyJLZP/kF98Lv8Y="
         ),
     },
     "ext": {
@@ -888,7 +891,7 @@ class App(tk.Tk):
         self._suppress_select = False  # True while render() restores the selection (see _on_select)
         self._col_base, self._col_min = {}, {}   # preferred / minimum column widths (see _layout_columns)
         self._tree_w, self._col_drag = 0, False
-        self._lines, self._lines_job = [], None
+        self._lines, self._lines_job, self._lines_state = [], None, None
         self._vlines, self._head_h = [], None   # column lines; measured height of the header row
         self._hsb_shown = False
         self._xorg = 2
@@ -937,16 +940,10 @@ class App(tk.Tk):
         self.toolbar = bar
         self.btn_check = self._button(bar, "Check for updates", "refresh", self.check_updates)
         self.btn_check.pack(side="left")
-        self._button(bar, "Mark as seen", "eye", self.mark_seen).pack(side="left", padx=(8, 0))
+        self._button(bar, "Mark as seen", "check", self.mark_seen).pack(side="left", padx=(8, 0))
         self._button(bar, "Open release page", "ext", self.open_release).pack(side="left", padx=(8, 0))
         self._button(bar, "Remove", "trash", self.remove_selected).pack(side="left", padx=(8, 0))
         self._button(bar, "Settings", "gear", self.open_settings).pack(side="right")
-        # Icon-only: shows the mode you will switch TO (moon = go dark, sun = go light).
-        self.btn_theme = self._button(bar, "", "moon", self.toggle_theme)
-        self.btn_theme.pack(side="right", padx=(0, 8))
-        Tooltip(self.btn_theme,
-                lambda: "Switch to light mode" if self.theme_name == "dark" else "Switch to dark mode",
-                lambda: (THEMES[self.theme_name]["tip_bg"], THEMES[self.theme_name]["tip_fg"]))
         self._button(bar, "Export", "export", self.export_json).pack(side="right", padx=(0, 8))
         self._button(bar, "Import", "import", self.import_json).pack(side="right", padx=(0, 8))
 
@@ -989,7 +986,7 @@ class App(tk.Tk):
         self.tree.bind("<Delete>", lambda e: self.remove_selected())
         self.tree.bind("<F2>", lambda e: self.rename_selected())
         self.tree.bind("<Button-1>", self._on_tree_click, add="+")
-        self.tree.bind("<Configure>", self._schedule_lines, add="+")
+        self.tree.bind("<Configure>", lambda e: self._schedule_lines(delay=40), add="+")
         self.tree.bind("<Configure>", self._layout_columns, add="+")
         self.tree.bind("<ButtonPress-1>", self._col_press, add="+")
         self.tree.bind("<ButtonRelease-1>", self._col_release, add="+")
@@ -1018,8 +1015,16 @@ class App(tk.Tk):
         self.menu.add_command(label="Remove", command=self.remove_selected)
 
         self.status = tk.StringVar(value="Add a project to get started.")
-        self.status_label = ttk.Label(self, textvariable=self.status, anchor="w", padding=(10, 6))
-        self.status_label.pack(fill="x")
+        self.status_bar = ttk.Frame(self)
+        self.status_bar.pack(fill="x")
+        # Icon-only, bottom right: shows the mode you will switch TO (moon = go dark, sun = go light).
+        self.btn_theme = self._button(self.status_bar, "", "moon", self.toggle_theme, style="Icon.TButton")
+        self.btn_theme.pack(side="right", padx=(0, 10), pady=2)
+        Tooltip(self.btn_theme,
+                lambda: "Switch to light mode" if self.theme_name == "dark" else "Switch to dark mode",
+                lambda: (THEMES[self.theme_name]["tip_bg"], THEMES[self.theme_name]["tip_fg"]))
+        self.status_label = ttk.Label(self.status_bar, textvariable=self.status, anchor="w", padding=(10, 6))
+        self.status_label.pack(side="left", fill="x", expand=True)
         self._build_text_menus()
 
     # ---- theme -----------------------------------------------------------
@@ -1036,6 +1041,12 @@ class App(tk.Tk):
         s.configure("TButton", background=c["btn_bg"], foreground=c["fg"], bordercolor=c["border"],
                     lightcolor=c["btn_bg"], darkcolor=c["btn_bg"], focuscolor=c["btn_bg"],
                     padding=(10, 4))
+        s.configure("Icon.TButton", background=c["bg"], bordercolor=c["bg"], lightcolor=c["bg"],
+                    darkcolor=c["bg"], focuscolor=c["bg"], relief="flat", padding=(6, 4))
+        s.map("Icon.TButton", background=[("pressed", c["btn_active"]), ("active", c["btn_active"])],
+              bordercolor=[("pressed", c["btn_active"]), ("active", c["btn_active"])],
+              lightcolor=[("pressed", c["btn_active"]), ("active", c["btn_active"])],
+              darkcolor=[("pressed", c["btn_active"]), ("active", c["btn_active"])])
         s.map("TButton",
               background=[("disabled", c["bg"]), ("pressed", c["btn_active"]), ("active", c["btn_active"])],
               foreground=[("disabled", c["sub_fg"])])
@@ -1078,8 +1089,8 @@ class App(tk.Tk):
         self.set_status("%s mode." % self.theme_name.capitalize())
 
     # ---- toolbar icons ---------------------------------------------------
-    def _button(self, parent, text, icon, command):
-        btn = ttk.Button(parent, text=text, command=command)
+    def _button(self, parent, text, icon, command, style=None):
+        btn = ttk.Button(parent, text=text, command=command, **({"style": style} if style else {}))
         self._btn_icons.append((btn, icon))
         return btn
 
@@ -1169,9 +1180,12 @@ class App(tk.Tk):
         self._schedule_lines()
         self._hide_pencil()
 
-    def _schedule_lines(self, _e=None):
+    def _schedule_lines(self, _e=None, delay=None):
+        """Redraw the separator lines once things settle. While the window is dragged the
+        events arrive in a burst; `delay` merges them into one redraw (much less work)."""
         if self._lines_job is None:
-            self._lines_job = self.after_idle(self._redraw_lines)
+            self._lines_job = (self.after(delay, self._redraw_lines) if delay
+                               else self.after_idle(self._redraw_lines))
 
     def _redraw_lines(self):
         self._lines_job = None
@@ -1190,13 +1204,17 @@ class App(tk.Tk):
             f.bind("<MouseWheel>", self._forward_wheel)
             self._lines.append(f)
         color = THEMES[self.theme_name]["line"]
-        for i, f in enumerate(self._lines):
-            if i < len(ys):
-                f.configure(bg=color)
-                f.place(x=0, y=ys[i], relwidth=1, height=1)
-                f.lift()
-            else:
-                f.place_forget()
+        # Row lines span the full width on their own (relwidth), so when only the width changed
+        # (window resize) they need no update at all.
+        if (ys, color) != self._lines_state:
+            self._lines_state = (ys, color)
+            for i, f in enumerate(self._lines):
+                if i < len(ys):
+                    f.configure(bg=color)
+                    f.place(x=0, y=ys[i], relwidth=1, height=1)
+                    f.lift()
+                else:
+                    f.place_forget()
         self._redraw_vlines()
 
     def _header_height(self):
@@ -1604,13 +1622,16 @@ class App(tk.Tk):
         self._schedule_lines()
 
     def _on_double_click(self, event):
-        """Open the release page only for a double-click on a project row.
+        """Double-click a project name to rename it; any other cell opens the release page.
 
         A fast second click on a column header (or on its resize edge, or on
         empty space) must not open anything.
         """
         if self.tree.identify_region(event.x, event.y) == "cell" and self.tree.identify_row(event.y):
-            self.open_release()
+            if self.tree.identify_column(event.x) == "#1":   # the Project column: rename, like the pencil
+                self.begin_rename(self.tree.identify_row(event.y))
+            else:
+                self.open_release()
 
     def _allow_select(self):
         self._suppress_select = False
