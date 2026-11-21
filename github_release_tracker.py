@@ -51,7 +51,7 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "GitHub Release Tracker"
 # Keep in step with the release tag: tag v1.1.1 <-> APP_VERSION "1.1.1" (build.bat checks the format).
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 APP_ID = "santosasarno-code.GitHubReleaseTracker"  # Windows taskbar identity (so the taskbar shows our icon)
 REPO_URL = "https://github.com/santosasarno-code/github-release-tracker"
 NO_DESCRIPTION = "No description, website, or topics provided."  # same wording GitHub shows for an empty About box
@@ -879,11 +879,14 @@ class App(tk.Tk):
             self.iconphoto(True, self.app_icon)
         except Exception:  # noqa: BLE001 - cosmetic only
             self.app_icon = None
-        # Toolbar icons: 16 px normally, 24 px on high-DPI screens (150% and up).
+        # Windows display scale (1.0 = 100%, 2.25 = 225%). Tk scales fonts by itself, but every
+        # pixel size written in this file (row height, column widths, window size) must follow it.
         try:
-            self.icon_px = 24 if self.winfo_fpixels("1i") / 96.0 >= 1.4 else 16
+            self.ui_scale = max(1.0, min(4.0, self.winfo_fpixels("1i") / 96.0))
         except tk.TclError:
-            self.icon_px = 16
+            self.ui_scale = 1.0
+        # Toolbar icons: 16 px normally, 24 px on high-DPI screens (150% and up).
+        self.icon_px = 24 if self.ui_scale >= 1.4 else 16
         self._btn_icons = []      # (button, icon name) pairs, recolored when the theme changes
         self._icon_refs = []      # PhotoImages must stay referenced or Tk blanks them
         self._pencil_imgs = {}
@@ -906,19 +909,23 @@ class App(tk.Tk):
         self.render()
         # Never let the window get narrower than the toolbar needs (buttons overlapped).
         self.update_idletasks()
-        min_w, min_h = max(700, self.toolbar.winfo_reqwidth() + 20), 340
+        min_w, min_h = max(self.px(700), self.toolbar.winfo_reqwidth() + self.px(20)), self.px(340)
         self.minsize(min_w, min_h)
         # Normal start size: wide enough that every column fits (no horizontal scrollbar),
         # but never bigger than the screen, never below the minimum; opens centered.
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        w = max(min(1260, sw - 40), min_w)
-        h = max(min(560, sh - 120), min_h)
+        w = max(min(self.px(1260), sw - 40), min_w)
+        h = max(min(self.px(560), sh - self.px(120)), min_h)
         self.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2), max(0, (sh - h) // 3)))
         self.after(100, self._poll)
         if self.data["settings"].get("check_on_launch") and self.data["projects"]:
             self.after(400, self.check_updates)
 
     # ---- layout ----------------------------------------------------------
+    def px(self, n):
+        """A design size in pixels at 100% scaling, converted to this display's scale."""
+        return int(round(n * self.ui_scale))
+
     def _build_ui(self):
         self.style = ttk.Style(self)
         try:
@@ -966,6 +973,7 @@ class App(tk.Tk):
             else:
                 self.tree.heading(cid, text=text, anchor="w")
             # No Tk "stretch": _layout_columns() resizes every column in proportion to the window.
+            w, mw = self.px(w), self.px(mw)
             self.tree.column(cid, width=w, minwidth=mw, stretch=False)
             self._col_base[cid], self._col_min[cid] = w, mw
         self.update_headings()
@@ -1055,7 +1063,7 @@ class App(tk.Tk):
         s.configure("TCheckbutton", background=c["bg"], foreground=c["fg"])
         s.map("TCheckbutton", background=[("active", c["bg"])])
         s.configure("Treeview", background=c["field"], fieldbackground=c["field"], foreground=c["fg"],
-                    bordercolor=c["border"], lightcolor=c["field"], darkcolor=c["field"], rowheight=26)
+                    bordercolor=c["border"], lightcolor=c["field"], darkcolor=c["field"], rowheight=self.px(26))
         s.map("Treeview", background=[("selected", c["sel_bg"])], foreground=[("selected", c["sel_fg"])])
         s.configure("Treeview.Heading", background=c["head_bg"], foreground=c["fg"], relief="flat",
                     bordercolor=c["border"], lightcolor=c["head_bg"], darkcolor=c["head_bg"],
@@ -1557,7 +1565,8 @@ class App(tk.Tk):
         for r in range(6):
             half = r if up else 5 - r
             img.put(color, to=(5 - half, r, 5 + half + 1, r + 1))
-        return img
+        k = int(round(self.ui_scale))
+        return img.zoom(k) if k > 1 else img   # keep the arrow the same visual size on high-DPI
 
     def update_headings(self):
         """Show an up/down arrow on the header of the column that is sorted."""

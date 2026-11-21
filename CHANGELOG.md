@@ -1,5 +1,8 @@
 # Changelog
 
+## [1.2.1]
+- Fix: at a high Windows display scale (for example 225%) the list rows were too short for the text, so the text was cut off, and the window and columns opened too small. Row height, column widths, window size and the sort arrow now follow the display scale. At 100% nothing changes.
+
 ## [1.2.0]
 - Double-click a project **name** to rename it (same as the pencil). Double-clicking any other column still opens the release page.
 - "Mark as seen" now has a checkbox icon.
