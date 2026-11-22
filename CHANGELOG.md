@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0]
+- Track projects on other hosts: **GitLab** (gitlab.com or your own server, with groups and subgroups), **Codeberg**, **Gitea**, **Forgejo** and self-hosted servers of those. Paste the project URL like a GitHub one; `owner/repo` still means GitHub.
+- Public repositories only, no token, and only official releases: a project with just tags (or no release yet) is refused when you add it. The optional GitHub token is sent to `github.com` only.
+- Projects from other hosts show the host in the Repository column. Their release links only open on the project's own host. Older versions skip these projects when reading `projects.json` and lose them when saving, so update every copy you share the file with. GitHub-only files are unchanged.
+- Security: names such as `..` are no longer accepted in an owner or repository name.
+- Brought in line with the Rust edition 2.1.0 (<https://github.com/santosasarno-code/github-release-tracker-rs>).
+
 ## [1.2.1]
 - Fix: at a high Windows display scale (for example 225%) the list rows were too short for the text, so the text was cut off, and the window and columns opened too small. Row height, column widths, window size and the sort arrow now follow the display scale. At 100% nothing changes.
 

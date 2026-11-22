@@ -51,7 +51,7 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "GitHub Release Tracker"
 # Keep in step with the release tag: tag v1.1.1 <-> APP_VERSION "1.1.1" (build.bat checks the format).
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 APP_ID = "santosasarno-code.GitHubReleaseTracker"  # Windows taskbar identity (so the taskbar shows our icon)
 REPO_URL = "https://github.com/santosasarno-code/github-release-tracker"
 NO_DESCRIPTION = "No description, website, or topics provided."  # same wording GitHub shows for an empty About box
@@ -285,6 +285,14 @@ class RateLimitError(GitHubError):
     pass
 
 
+class NetworkError(GitHubError):
+    """The server could not be reached at all (DNS, refused, timeout, certificate)."""
+
+
+class NoReleasesError(GitHubError):
+    pass
+
+
 # Remaining API calls reported by the last response (None = unknown).
 last_rate_remaining = None
 
@@ -502,6 +510,218 @@ def get_latest(owner, repo, token="", include_prereleases=True):
     return fetch_latest_release(owner, repo, token, include_prereleases)
 
 
+# --------------------------------------------------------------------------
+# Other hosts: GitLab, Gitea / Forgejo (Codeberg) and self-hosted servers.
+# Public repositories only, no token, official releases only (not bare tags).
+# A GitHub project has no "host" / "kind" keys, so GitHub-only files stay as they were.
+# --------------------------------------------------------------------------
+KNOWN_HOSTS = {   # host -> kind ("gitea" also covers Forgejo, which speaks the same API)
+    "gitlab.com": "gitlab",
+    "codeberg.org": "gitea",
+    "gitea.com": "gitea",
+    "code.forgejo.org": "gitea",
+}
+SEG_RE = re.compile(r"^(?!\.+$)[A-Za-z0-9_.-]{1,100}$")
+HOST_RE = re.compile(r"^(?:http://)?[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::\d{1,5})?$")
+KINDS = ("gitlab", "gitea")
+MAX_BODY = 2 * 1024 * 1024
+MAX_PATH_SEGMENTS = 20
+
+
+def host_base(host):
+    """Base URL of a stored host: "codeberg.org" -> https://codeberg.org, "http://x:3000" stays http."""
+    return host if host.startswith("http://") else "https://" + host
+
+
+def host_label(host):
+    return host[len("http://"):] if host.startswith("http://") else host
+
+
+def parse_project_ref(text):
+    """Understand a pasted project reference.
+
+    Returns (host, kind, segments) or None.
+      - host "" = github.com (segments = [owner, repo]);
+      - otherwise host is "example.org" (https) or "http://example.org:3000" (only when typed so);
+      - kind is "gitlab" / "gitea" for known hosts, None for unknown servers (found out later).
+    """
+    text = (text or "").strip()
+    gh = parse_repo(text)
+    if gh:
+        return "", None, [gh[0], gh[1]]
+    m = re.match(r"^(https?)://([^/\s?#]+)([^?#\s]*)", text, re.I)
+    if m:
+        scheme, netloc, path = m.group(1).lower(), m.group(2).lower(), m.group(3)
+    else:   # "codeberg.org/owner/repo" without the scheme
+        m = re.match(r"^((?:[a-z0-9-]+\.)+[a-z0-9-]+(?::\d{1,5})?)/([^?#\s]*)$", text, re.I)
+        if not m:
+            return None
+        scheme, netloc, path = "https", m.group(1).lower(), "/" + m.group(2)
+    if "@" in netloc or netloc in ("github.com", "www.github.com"):
+        return None
+    host = netloc if scheme == "https" else "http://" + netloc
+    if not HOST_RE.match(host):
+        return None
+    kind = KNOWN_HOSTS.get(netloc)
+    path = path.split("/-/")[0]
+    if path.endswith("/-"):
+        path = path[:-2]
+    segs = [x for x in path.split("/") if x]
+    if segs and segs[-1].endswith(".git"):
+        segs[-1] = segs[-1][:-4]
+    if len(segs) < 2 or len(segs) > MAX_PATH_SEGMENTS or not all(SEG_RE.match(x) for x in segs):
+        return None
+    if kind == "gitea":
+        segs = segs[:2]
+    return host, kind, segs
+
+
+def split_path(segs):
+    return "/".join(segs[:-1]), segs[-1]
+
+
+def http_json(url):
+    """GET a public JSON document (no credentials are ever sent)."""
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": "GitHubReleaseTracker",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read(MAX_BODY + 1)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise NotFoundError("Not found (wrong name, or a private repository).")
+        if e.code in (401, 403):
+            raise GitHubError("The server asks for a sign-in (HTTP %d). Only public repositories "
+                              "work, and tokens are not supported for this host." % e.code)
+        if e.code == 429:
+            raise GitHubError("The server is rate-limiting requests (429). Try again later.")
+        raise GitHubError("The server returned HTTP %d." % e.code)
+    except urllib.error.URLError as e:
+        raise NetworkError("Network error: %s" % e.reason)
+    except (TimeoutError, OSError) as e:
+        raise NetworkError("Network error: %s" % e)
+    if len(body) > MAX_BODY:
+        raise GitHubError("The server's answer was too large.")
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise GitHubError("Unexpected answer (not JSON). This does not look like a GitLab or Gitea/Forgejo server.")
+
+
+def _api_url(base, kind, path, tail=""):
+    if kind == "gitea":
+        return "%s/api/v1/repos/%s%s" % (base, "/".join(urllib.parse.quote(x, safe="") for x in path), tail)
+    return "%s/api/v4/projects/%s%s" % (base, urllib.parse.quote("/".join(path), safe=""), tail)
+
+
+def _host_info(base, host, kind, path):
+    d = http_json(_api_url(base, kind, path))
+    if not isinstance(d, dict):
+        raise GitHubError("Unexpected answer from the server.")
+    full = d.get("full_name") if kind == "gitea" else d.get("path_with_namespace")
+    if not (isinstance(full, str) and full):
+        raise NotFoundError("Not found on this server.")
+    parts = full.split("/")
+    if not (2 <= len(parts) <= MAX_PATH_SEGMENTS and all(SEG_RE.match(x) for x in parts)):
+        raise GitHubError("Unexpected project name from the server.")
+    owner, repo = split_path(parts)
+    page = base + "/" + full
+    url = d.get("html_url") if kind == "gitea" else d.get("web_url")
+    return {
+        "owner": owner,
+        "repo": repo,
+        "title": _s(d.get("name"), 200) or repo,
+        "description": _s(d.get("description"), 500),
+        "html_url": safe_url(url, base, page),
+        "host": host,
+        "kind": kind,
+    }
+
+
+def _host_release(base, kind, owner, repo, r):
+    """One release object from the server -> this app's release dict (None if unusable)."""
+    if not isinstance(r, dict) or r.get("draft"):
+        return None
+    tag = _s(r.get("tag_name"), 200)
+    if not tag:
+        return None
+    full = "%s/%s" % (owner, repo)
+    if kind == "gitea":
+        rid = r.get("id") if isinstance(r.get("id"), int) and not isinstance(r.get("id"), bool) else tag
+        when = r.get("published_at") or r.get("created_at") or ""
+        url = r.get("html_url")
+        fallback = "%s/%s/releases/tag/%s" % (base, full, urllib.parse.quote(tag, safe=""))
+        pre = bool(r.get("prerelease"))
+    else:
+        if r.get("upcoming_release"):   # dated in the future: not released yet
+            return None
+        rid, pre = tag, False
+        when = r.get("released_at") or r.get("created_at") or ""
+        links = r.get("_links") if isinstance(r.get("_links"), dict) else {}
+        url = links.get("self")
+        fallback = "%s/%s/-/releases/%s" % (base, full, urllib.parse.quote(tag, safe=""))
+    return {
+        "id": rid,
+        "tag": tag,
+        "name": _s(r.get("name"), 300),
+        "published_at": _s(when, 40),
+        "url": safe_url(url, base, fallback),
+        "prerelease": pre,
+        "source": "release",
+    }
+
+
+def fetch_latest_host(host, kind, owner, repo, include_prereleases=True):
+    """Newest official release of a project on another host, or None if it has none."""
+    base = host_base(host)
+    path = (owner + "/" + repo).split("/")
+    data = http_json(_api_url(base, kind, path, "/releases?%s=10" % ("limit" if kind == "gitea" else "per_page")))
+    if not isinstance(data, list):
+        raise GitHubError("Unexpected answer from the server.")
+    rels = [x for x in (_host_release(base, kind, owner, repo, r) for r in data) if x]
+    if not rels:
+        return None
+    if not include_prereleases:
+        for r in rels:
+            if not r["prerelease"]:
+                return r
+    return rels[0]
+
+
+def resolve_project(host, kind, segs, include_prereleases=True):
+    """Add-time lookup on another host: find out what the server is, check that the project
+    exists and has an official release. Returns (info, latest)."""
+    base = host_base(host)
+    last = None
+    for k in ([kind] if kind else ["gitea", "gitlab"]):
+        path = segs[:2] if k == "gitea" else segs
+        try:
+            info = _host_info(base, host, k, path)
+            latest = fetch_latest_host(host, k, info["owner"], info["repo"], include_prereleases)
+        except NetworkError:
+            raise                      # the server is not reachable: trying another kind will not help
+        except GitHubError as e:
+            last = last or e
+            continue
+        if not latest:
+            raise NoReleasesError("%s has no official releases (only tags, or nothing yet), "
+                                  "so it cannot be tracked." % info["title"])
+        return info, latest
+    if kind or isinstance(last, GitHubError) and not isinstance(last, NotFoundError):
+        raise last
+    raise NotFoundError("Could not find this project on %s. It must be a public repository on a "
+                        "GitLab, Gitea or Forgejo server." % host_label(host))
+
+
+def fetch_latest_for(p_host, p_kind, owner, repo, token, include_prereleases):
+    """Latest release for a GitHub project (host "") or one on another host."""
+    if not p_host:
+        return get_latest(owner, repo, token, include_prereleases)
+    return fetch_latest_host(p_host, p_kind, owner, repo, include_prereleases)
+
+
 def apply_result(p, latest, err, now):
     """Store one check result on project p, without inventing false updates."""
     p["last_checked"] = now
@@ -525,19 +745,43 @@ def apply_result(p, latest, err, now):
 # --------------------------------------------------------------------------
 # Storage, import and export (all input is treated as untrusted)
 # --------------------------------------------------------------------------
-NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+NAME_RE = re.compile(r"^(?!\.+$)[A-Za-z0-9_.-]{1,100}$")   # no "." / ".." (path tricks)
 
 
 def _s(value, limit=300):
     return value.strip()[:limit] if isinstance(value, str) else ""
 
 
-def safe_github_url(url, fallback):
-    """Only ever open https://github.com/... links, whatever a JSON file says."""
-    if (isinstance(url, str) and url.startswith("https://github.com/") and len(url) < 500
+def safe_url(url, base, fallback):
+    """Only ever open links that live on the project's own host, whatever a JSON file says."""
+    if (isinstance(url, str) and url.startswith(base + "/") and len(url) < 500
             and not any(c.isspace() for c in url)):
         return url
     return fallback
+
+
+def safe_github_url(url, fallback):
+    return safe_url(url, "https://github.com", fallback)
+
+
+def project_base(p):
+    return host_base(p["host"]) if p.get("host") else "https://github.com"
+
+
+def repo_page(p):
+    return "%s/%s/%s" % (project_base(p), p["owner"], p["repo"])
+
+
+def release_page(p):
+    """The page listing the project's releases (used when no exact release link is known)."""
+    tail = "/-/releases" if p.get("kind") == "gitlab" else "/releases"
+    return repo_page(p) + tail
+
+
+def repo_label(p):
+    """What the Repository column shows: owner/repo, with the host in front for other hosts."""
+    full = "%s/%s" % (p["owner"], p["repo"])
+    return "%s/%s" % (host_label(p["host"]), full) if p.get("host") else full
 
 
 def _id_value(value):
@@ -546,7 +790,7 @@ def _id_value(value):
     return value[:300] if isinstance(value, str) else value
 
 
-def normalize_release(r, owner, repo):
+def normalize_release(r, base, fallback):
     if not isinstance(r, dict):
         return None
     tag = _s(r.get("tag"), 200)
@@ -561,7 +805,7 @@ def normalize_release(r, owner, repo):
         "tag": tag,
         "name": _s(r.get("name"), 300),
         "published_at": _s(r.get("published_at"), 40),
-        "url": safe_github_url(r.get("url"), "https://github.com/%s/%s/releases" % (owner, repo)),
+        "url": safe_url(r.get("url"), base, fallback),
         "prerelease": bool(r.get("prerelease")),
         "source": source if source in ("release", "tag", "feed") else "release",
     }
@@ -582,31 +826,50 @@ def display_name(p):
 def normalize_project(raw):
     """Return a clean project dict from untrusted input, or None if unusable."""
     if isinstance(raw, str):
-        parsed = parse_repo(raw)
-        if not parsed:
+        ref = parse_project_ref(raw)
+        if not ref or (ref[0] and not ref[1]):   # an unknown server cannot be identified offline
             return None
-        raw = {"owner": parsed[0], "repo": parsed[1]}
+        owner, repo = split_path(ref[2])
+        raw = {"owner": owner, "repo": repo}
+        if ref[0]:
+            raw["host"], raw["kind"] = ref[0], ref[1]
     if not isinstance(raw, dict):
         return None
     owner, repo = raw.get("owner"), raw.get("repo")
-    if not (isinstance(owner, str) and isinstance(repo, str)
-            and NAME_RE.match(owner) and NAME_RE.match(repo)):
+    host, kind = raw.get("host"), raw.get("kind")
+    if host in (None, "", "github.com"):
+        host = kind = None
+        ok = (isinstance(owner, str) and isinstance(repo, str)
+              and NAME_RE.match(owner) and NAME_RE.match(repo))
+    else:
+        host = host.lower() if isinstance(host, str) else ""
+        ok = (HOST_RE.match(host) is not None and kind in KINDS and isinstance(owner, str)
+              and isinstance(repo, str) and bool(NAME_RE.match(repo))
+              and 1 <= len(owner.split("/")) < MAX_PATH_SEGMENTS
+              and all(SEG_RE.match(x) for x in owner.split("/")))
+    if not ok:
         return None
+    ref = {"owner": owner, "repo": repo, "host": host, "kind": kind}
+    base = project_base(ref)
     fmt = raw.get("fmt")
     out = {
         "owner": owner,
         "repo": repo,
+    }
+    if host:   # only projects on other hosts carry these keys
+        out["host"], out["kind"] = host, kind
+    out.update({
         "title": _s(raw.get("title"), 200) or repo,
         "description": _s(raw.get("description"), 500),
-        "html_url": safe_github_url(raw.get("html_url"), "https://github.com/%s/%s" % (owner, repo)),
+        "html_url": safe_url(raw.get("html_url"), base, repo_page(ref)),
         "include_prereleases": bool(raw.get("include_prereleases", True)),
         "fmt": fmt if fmt == 2 else None,
-        "latest": normalize_release(raw.get("latest"), owner, repo),
+        "latest": normalize_release(raw.get("latest"), base, release_page(ref)),
         "seen_id": _id_value(raw.get("seen_id")),
         "seen_tag": _s(raw.get("seen_tag"), 200) or None,
         "last_checked": _s(raw.get("last_checked"), 40),
         "error": _s(raw.get("error"), 300) or None,
-    }
+    })
     custom = clean_name(raw.get("custom_name"))
     if custom:  # only present when the user renamed the project
         out["custom_name"] = custom
@@ -741,6 +1004,8 @@ def save_data(data):
 
 
 def project_key(p):
+    if p.get("host"):
+        return ("%s/%s/%s" % (host_label(p["host"]), p["owner"], p["repo"])).lower()
     return ("%s/%s" % (p["owner"], p["repo"])).lower()
 
 
@@ -935,7 +1200,7 @@ class App(tk.Tk):
 
         top = ttk.Frame(self, padding=(10, 10, 10, 4))
         top.pack(fill="x")
-        ttk.Label(top, text="GitHub project (URL or owner/repo):").pack(side="left")
+        ttk.Label(top, text="Project (repo URL or owner/repo):").pack(side="left")
         self.entry = ttk.Entry(top)
         self.entry.pack(side="left", fill="x", expand=True, padx=8)
         self.entry.bind("<Return>", lambda e: self.add_project())
@@ -1619,7 +1884,7 @@ class App(tk.Tk):
             checked = (p.get("last_checked") or "")[:16].replace("T", " ")
             self.tree.insert("", "end", iid=project_key(p), tags=(tag,) if tag else (), values=(
                 display_name(p),
-                "%s/%s" % (p["owner"], p["repo"]),
+                repo_label(p),
                 release or "-",
                 (latest.get("published_at") or "")[:10] or "-",
                 status_text(p),
@@ -1677,18 +1942,24 @@ class App(tk.Tk):
     def add_project(self):
         if self.busy:
             return
-        parsed = parse_repo(self.entry.get())
-        if not parsed:
-            messagebox.showerror(APP_NAME, "Enter a GitHub URL such as\nhttps://github.com/owner/repo\nor just owner/repo.")
+        ref = parse_project_ref(self.entry.get())
+        if not ref:
+            messagebox.showerror(APP_NAME, "Enter a project URL such as\nhttps://github.com/owner/repo,\n"
+                                 "https://codeberg.org/owner/repo or https://gitlab.com/group/project\n"
+                                 "(any GitLab, Gitea or Forgejo server works), or just owner/repo for GitHub.")
             return
-        owner, repo = parsed
-        if any(project_key(p) == ("%s/%s" % (owner, repo)).lower() for p in self.data["projects"]):
-            messagebox.showinfo(APP_NAME, "%s/%s is already in the list." % (owner, repo))
+        host, kind, segs = ref
+        owner, repo = split_path(segs)
+        shown = "%s/%s/%s" % (host_label(host), owner, repo) if host else "%s/%s" % (owner, repo)
+        if any(project_key(p) == shown.lower() for p in self.data["projects"]):
+            messagebox.showinfo(APP_NAME, "%s is already in the list." % shown)
             return
         token = self.token()
-        self.set_busy(True, "Adding %s/%s ..." % (owner, repo))
+        self.set_busy(True, "Adding %s ..." % shown)
 
         def work():
+            if host:   # another host: public repositories only, official releases only
+                return resolve_project(host, kind, segs, True)
             latest = get_latest(owner, repo, token, True)
             try:
                 info = fetch_repo_info(owner, repo, token)
@@ -1739,15 +2010,15 @@ class App(tk.Tk):
             self.set_status("Nothing to check - add a project first.")
             return
         token = self.token()
-        snapshot = [(p["owner"], p["repo"], bool(p.get("include_prereleases"))) for p in self.data["projects"]]
+        snapshot = [(p.get("host") or "", p.get("kind"), p["owner"], p["repo"], bool(p.get("include_prereleases")),
+                     project_key(p)) for p in self.data["projects"]]
         self.set_busy(True, "Checking %d project(s) ..." % len(snapshot))
 
         def work():
             out = []
-            for owner, repo, inc in snapshot:
-                key = ("%s/%s" % (owner, repo)).lower()
+            for host, kind, owner, repo, inc, key in snapshot:
                 try:
-                    out.append((key, get_latest(owner, repo, token, inc), None))
+                    out.append((key, fetch_latest_for(host, kind, owner, repo, token, inc), None))
                 except RateLimitError as e:
                     out.append((key, None, str(e)))
                     break  # no point continuing
@@ -1804,14 +2075,13 @@ class App(tk.Tk):
             self.set_status("Select a project first.")
             return
         p = sel[0]
-        fallback = "https://github.com/%s/%s/releases" % (p["owner"], p["repo"])
-        webbrowser.open(safe_github_url((p.get("latest") or {}).get("url"), fallback))
+        webbrowser.open(safe_url((p.get("latest") or {}).get("url"), project_base(p), release_page(p)))
 
     def open_repo(self):
         sel = self.selected_projects()
         if sel:
             p = sel[0]
-            webbrowser.open(safe_github_url(p.get("html_url"), "https://github.com/%s/%s" % (p["owner"], p["repo"])))
+            webbrowser.open(safe_url(p.get("html_url"), project_base(p), repo_page(p)))
 
     def toggle_prerelease(self):
         sel = self.selected_projects()
@@ -1908,7 +2178,7 @@ class App(tk.Tk):
         body = ttk.Frame(win, padding=14)
         body.pack(fill="both", expand=True)
 
-        ttk.Label(body, text="GitHub personal access token (optional)").grid(row=0, column=0, sticky="w")
+        ttk.Label(body, text="GitHub personal access token (optional, used for github.com only)").grid(row=0, column=0, sticky="w")
         tok = tk.StringVar(value=self.data["settings"].get("token", ""))
         ent = ttk.Entry(body, textvariable=tok, show="*", width=52)
         ent.grid(row=1, column=0, sticky="we", pady=(2, 2))

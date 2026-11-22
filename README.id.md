@@ -1,6 +1,6 @@
 # GitHub Release Tracker
 
-Aplikasi Windows portable berukuran kecil untuk memantau release terbaru dari proyek GitHub yang Anda ikuti, dan memberi tahu kalau ada release baru. Tanpa akun, tanpa login, dan tanpa token.
+Aplikasi Windows portable berukuran kecil untuk memantau release terbaru dari proyek yang Anda ikuti (GitHub, GitLab, Codeberg, Gitea / Forgejo, dan server self-hosted), dan memberi tahu kalau ada release baru. Tanpa akun, tanpa login, dan tanpa token.
 
 🇬🇧 [Read in English](README.md)
 
@@ -11,6 +11,7 @@ Aplikasi Windows portable berukuran kecil untuk memantau release terbaru dari pr
 ## Fitur
 
 - Tambah proyek dengan menempel URL GitHub atau `owner/repo`
+- **Host lain, caranya sama.** Tempel URL proyek di **GitLab** (`gitlab.com` atau server sendiri, termasuk grup dan subgrup), **Codeberg**, **Gitea**, **Forgejo**, atau server self-hosted dari semuanya. Hanya repo publik, tanpa token. Hanya **rilis resmi** yang dipantau: proyek yang hanya punya tag (atau belum punya apa-apa) ditolak saat ditambahkan
 - Lihat nama proyek, repository, release saat ini, tanggal rilis, dan status sekilas
 - **Check for updates** menyegarkan semua proyek; proyek dengan release lebih baru disorot sebagai `Update available: v1.0 -> v1.1`
 - **Mark as seen** menghapus sorotan setelah Anda selesai menangani update
@@ -98,7 +99,9 @@ pyinstaller --onefile --windowed --icon icon.ico --name GitHubReleaseTracker git
 - Kalau feed gagal atau proyek tidak punya release, aplikasi beralih ke API GitHub (yang membolehkan sekitar 60 permintaan per jam tanpa token). Kalau proyek sama sekali tidak punya GitHub Release, yang ditampilkan adalah git tag terbaru.
 - Saat Anda menambah proyek, release yang ada saat itu dianggap sudah dilihat. Hanya release yang terbit sesudahnya yang ditandai sebagai update.
 - Deteksi update membandingkan identitas release (dan tag), bukan nomor versi, jadi tag tidak biasa seperti `nightly` atau `build-123` tetap bisa. Efek sampingnya: release yang dihapus lalu dibuat ulang bisa muncul sebagai update.
-- Aplikasi hanya menghubungi `github.com` dan `api.github.com`.
+- Proyek di host lain dibaca lewat API publik host itu (GitLab: `/api/v4/projects/<path>/releases`, Gitea / Forgejo / Codeberg: `/api/v1/repos/<owner>/<repo>/releases`). Rilis draf dan rilis "upcoming" GitLab diabaikan. Untuk server yang tidak dikenal, aplikasi mencoba API Gitea / Forgejo dulu lalu GitLab, satu kali, saat proyek ditambahkan. Token tidak pernah dikirim ke host ini (token GitHub opsional hanya dipakai untuk `github.com`).
+- Tautan yang tersimpan di data Anda hanya dibuka jika mengarah ke host proyek itu sendiri.
+- Aplikasi hanya menghubungi `github.com` dan `api.github.com`, ditambah host proyek yang Anda tambahkan sendiri.
 
 ## Data Anda
 
@@ -113,6 +116,8 @@ pyinstaller --onefile --windowed --icon icon.ico --name GitHubReleaseTracker git
 - Feed tidak memberi tahu release mana yang pre-release, jadi label `(pre-release)` tidak tampil untuk hasil dari feed. Mode "stable only" (klik kanan proyek, hapus centang *Include pre-releases*) memakai API dan batas permintaannya.
 - Feed adalah halaman publik GitHub, bukan API resmi; GitHub bisa mengubah atau membatasinya.
 - Repository privat tidak didukung tanpa token.
+- Host lain: hanya repo publik (tanpa token), hanya rilis resmi (bukan tag saja), dan GitLab tidak punya penanda pre-release. Server self-hosted dengan sertifikat yang tidak dipercaya Windows ditolak (aplikasi tidak pernah mematikan pemeriksaan sertifikat). Alamat `http://` hanya dipakai kalau Anda mengetiknya.
+- Versi lama (sebelum ini) tidak memahami proyek dari host lain: proyek itu dilewati saat membaca `projects.json` dan hilang saat menyimpan. Pakai versi baru di semua tempat yang berbagi file itu.
 - Tanggal "Published" berasal dari waktu update di feed, jadi mengedit release di GitHub bisa mengubahnya.
 - Deskripsi proyek (tampil di status bar saat dipilih) dibaca sekali ketika proyek ditambahkan dan tidak diperbarui lagi. Kalau API GitHub sedang tidak tersedia saat itu, proyek menampilkan "No description, website, or topics provided." walaupun repository-nya sebenarnya punya deskripsi.
 - Garis antar baris dan kolom serta pensil rename adalah widget kecil yang digambar di atas daftar. Klik tepat pada garis setebal 1 piksel diteruskan ke barisnya, tetapi *klik dua kali* tepat di garis itu bisa gagal membuka halaman release.

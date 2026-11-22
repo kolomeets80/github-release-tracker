@@ -1,6 +1,6 @@
 # GitHub Release Tracker
 
-A small, portable Windows app that tracks the latest release of the GitHub projects you care about and tells you when a new one appears. No account, no login, and no token needed.
+A small, portable Windows app that tracks the latest release of the projects you care about (GitHub, GitLab, Codeberg, Gitea / Forgejo and self-hosted servers) and tells you when a new one appears. No account, no login, and no token needed.
 
 🇮🇩 [Baca dalam Bahasa Indonesia](README.id.md)
 
@@ -11,6 +11,7 @@ A small, portable Windows app that tracks the latest release of the GitHub proje
 ## Features
 
 - Add a project by pasting a GitHub URL or `owner/repo`
+- **Other hosts, same way.** Paste the URL of a project on **GitLab** (`gitlab.com` or your own server, including groups and subgroups), **Codeberg**, **Gitea**, **Forgejo** or any self-hosted server of those. Public repositories only, no token. Only **official releases** are tracked: a project that has just tags (or nothing yet) is refused when you add it
 - See the project name, repository, current release, publish date and status at a glance
 - **Check for updates** refreshes every project; a project with a newer release is highlighted as `Update available: v1.0 -> v1.1`
 - **Mark as seen** clears the highlight once you have dealt with an update
@@ -98,7 +99,9 @@ pyinstaller --onefile --windowed --icon icon.ico --name GitHubReleaseTracker git
 - If the feed fails or a project has no releases, it falls back to GitHub's API (which allows about 60 requests per hour without a token). If the project has no GitHub Releases at all, it shows the newest git tag instead.
 - When you add a project, its current release counts as already seen. Only releases published afterwards are flagged as updates.
 - Update detection compares the release identity (and tag), not version numbers, so unusual tags like `nightly` or `build-123` work. Side effect: a deleted and re-created release can show up as an update.
-- The app contacts only `github.com` and `api.github.com`.
+- Projects on other hosts are read through that host's public API (GitLab: `/api/v4/projects/<path>/releases`, Gitea / Forgejo / Codeberg: `/api/v1/repos/<owner>/<repo>/releases`). Draft releases and GitLab "upcoming" releases are ignored. For a server it does not know, the app tries the Gitea / Forgejo API first and then GitLab's, once, when you add the project. No token is ever sent to these hosts (the optional GitHub token is used for `github.com` only).
+- Links stored in your data are only opened if they point to the project's own host.
+- The app contacts only `github.com` and `api.github.com`, plus the hosts of projects you add yourself.
 
 ## Your data
 
@@ -112,7 +115,9 @@ pyinstaller --onefile --windowed --icon icon.ico --name GitHubReleaseTracker git
 - Windows only (developed for Windows 10/11).
 - The release feed does not say which releases are pre-releases, so the `(pre-release)` label is not shown for feed results. "Stable only" mode (right-click a project, untick *Include pre-releases*) uses the API and its rate limit.
 - The feed is a public GitHub page, not an official API; GitHub could change or throttle it.
-- Private repositories are not supported without a token.
+- Private repositories are not supported without a token (GitHub only).
+- Other hosts: public repositories only (no token), official releases only (not bare tags), and there is no pre-release marker on GitLab. A self-hosted server with a certificate Windows does not trust is refused (the app never turns certificate checks off). A `http://` address is used only if you type it that way.
+- Older versions (before this one) do not understand projects from other hosts: they skip them when reading `projects.json` and drop them when saving. Use the new version everywhere you share the file.
 - The "Published" date comes from the feed's updated time, so editing a release on GitHub can change it.
 - A project's description (shown in the status bar when you select it) is read once, when the project is added, and is not refreshed later. If the GitHub API was unavailable at that moment, the project shows "No description, website, or topics provided." even if the repository has one.
 - The row and column lines and the rename pencil are small widgets drawn over the list. A click exactly on a 1-pixel line is passed on to the row, but a *double*-click exactly on that line may not open the release page.
