@@ -1,3 +1,4 @@
+from urllib.parse import urlparse, urlunparse
 import json
 import re
 import sys
@@ -26,8 +27,9 @@ GAME_TITLE_AND_YEAR_RE = re.compile(
 
 ANY_URL_RE = re.compile(r"https?://[^\s\]>]+", re.IGNORECASE)
 
-GITHUB_REPO_RE = re.compile(
-    r"^https?://(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?=[/?#]|$)",
+# Only matches GitHub, GitLab, and self-hosted "git." hosts: http(s)://<host>/<owner>/<repo>
+GIT_REPO_RE = re.compile(
+    r"^(https?://(?:(?:www\.)?github\.com|(?:[A-Za-z0-9-]+\.)*gitlab[A-Za-z0-9.-]*|git\.[A-Za-z0-9.-]+)(?::\d+)?)/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?=[/?#]|$)",
     re.IGNORECASE,
 )
 
@@ -52,6 +54,74 @@ def normalize_url(url: str) -> str:
     return (url or "").strip().rstrip("/").lower()
 
 
+def is_github_host(host: str) -> bool:
+    h = (host or "").lower().split(":")[0]
+    return h in ("github.com", "www.github.com")
+
+
+def is_gitlab_host(host: str) -> bool:
+    h = (host or "").lower().split(":")[0]
+    return h == "gitlab.com" or "gitlab" in h
+
+
+def is_git_dot_host(host: str) -> bool:
+    h = (host or "").lower().split(":")[0]
+    return h.startswith("git.")
+
+
+def infer_kind(host: str, raw_url: str = "") -> str | None:
+    h = (host or "").lower().split(":")[0]
+    u = (raw_url or "").lower()
+    if is_github_host(h):
+        return "github"
+    if is_gitlab_host(h) or "/-/" in u:
+        return "gitlab"
+    if is_git_dot_host(h):
+        return "gitea"
+    return None
+
+
+def parse_repo_url(url: str) -> tuple[str, str, str, str, str, str] | None:
+    """Return (origin_url, host, kind, owner, repo, clean_repo_url) or None."""
+    cleaned = (url or "").strip().rstrip(".,;:")
+    match = GIT_REPO_RE.match(cleaned)
+    if not match:
+        return None
+
+    origin = match.group(1).rstrip("/")
+    owner = match.group(2)
+    repo = match.group(3)
+
+    parsed = urlparse(origin)
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    if netloc == "www.github.com":
+        netloc = "github.com"
+
+    host = netloc.split(":")[0]
+    kind = infer_kind(host, cleaned)
+    if not kind:
+        return None
+
+    normalized_origin = urlunparse((scheme, netloc, "", "", "", ""))
+    clean_url = f"{normalized_origin}/{owner}/{repo}"
+    return normalized_origin, host, kind, owner, repo, clean_url
+
+
+def infer_origin_from_html_url(html_url: str | None) -> str:
+    parsed_info = parse_repo_url(html_url or "")
+    if parsed_info:
+        return parsed_info[0]
+
+    raw = (html_url or "").strip()
+    if raw:
+        parsed = urlparse(raw)
+        if parsed.scheme and parsed.netloc:
+            return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), "", "", "", ""))
+
+    return "https://github.com"
+
+
 def default_settings() -> dict:
     return {
         "token": "",
@@ -63,27 +133,33 @@ def default_settings() -> dict:
 
 
 def unique_case_tweaked_target(
-    owner: str, repo: str, used_urls: set[str]
+    owner: str,
+    repo: str,
+    used_urls: set[str],
+    origin: str = "https://github.com",
 ) -> tuple[str, str, str]:
     """Return (owner, repo, html_url) by flipping the next letter on collision."""
-    base_url = f"https://github.com/{owner}/{repo}"
-    if base_url not in used_urls:
+    base_origin = (origin or "https://github.com").rstrip("/")
+    base_url = f"{base_origin}/{owner}/{repo}"
+    normalized_used = {normalize_url(u) for u in used_urls}
+
+    if normalize_url(base_url) not in normalized_used:
         used_urls.add(base_url)
         return owner, repo, base_url
 
     for i, ch in enumerate(owner):
         if ch.isalpha():
             new_owner = owner[:i] + ch.upper() + owner[i + 1 :]
-            url = f"https://github.com/{new_owner}/{repo}"
-            if url not in used_urls:
+            url = f"{base_origin}/{new_owner}/{repo}"
+            if normalize_url(url) not in normalized_used:
                 used_urls.add(url)
                 return new_owner, repo, url
 
     for i, ch in enumerate(repo):
         if ch.isalpha():
             new_repo = repo[:i] + ch.upper() + repo[i + 1 :]
-            url = f"https://github.com/{owner}/{new_repo}"
-            if url not in used_urls:
+            url = f"{base_origin}/{owner}/{new_repo}"
+            if normalize_url(url) not in normalized_used:
                 used_urls.add(url)
                 return owner, new_repo, url
 
@@ -92,31 +168,51 @@ def unique_case_tweaked_target(
 
 
 def make_project_entry(
-    owner: str, repo: str, title: str, html_url: str | None = None
+    owner: str,
+    repo: str,
+    title: str,
+    html_url: str | None = None,
+    host: str | None = None,
+    kind: str | None = None,
 ) -> dict:
     resolved_url = html_url or f"https://github.com/{owner}/{repo}"
-    return {
+    parsed_info = parse_repo_url(resolved_url)
+    resolved_host = host or (parsed_info[1] if parsed_info else "github.com")
+    resolved_kind = kind or (parsed_info[2] if parsed_info else infer_kind(resolved_host, resolved_url)) or "github"
+
+    entry: dict = {
         "owner": owner,
         "repo": repo,
-        "title": title or repo,
-        "description": "",
-        "html_url": resolved_url,
-        "include_prereleases": True,
-        "fmt": 2,
-        "latest": {
-            "id": "",
-            "tag": "",
-            "name": "",
-            "published_at": "",
-            "url": "",
-            "prerelease": False,
-            "source": "",
-        },
-        "seen_id": "",
-        "seen_tag": "",
-        "last_checked": "",
-        "error": None,
     }
+
+    # Only add host & kind for GitLab and self-hosted "git." hosts (not GitHub)
+    if resolved_kind != "github":
+        entry["host"] = resolved_host
+        entry["kind"] = resolved_kind
+
+    entry.update(
+        {
+            "title": title or repo,
+            "description": "",
+            "html_url": resolved_url,
+            "include_prereleases": True,
+            "fmt": 2,
+            "latest": {
+                "id": "",
+                "tag": "",
+                "name": "",
+                "published_at": "",
+                "url": "",
+                "prerelease": False,
+                "source": "",
+            },
+            "seen_id": "",
+            "seen_tag": "",
+            "last_checked": "",
+            "error": None,
+        }
+    )
+    return entry
 
 
 def extract_game_title(entry_text: str, fallback: str = "") -> str:
@@ -197,7 +293,7 @@ def scan_recompilation_section(
 ) -> dict:
     locations = game_locations or {}
     unmatched_entries = []
-    # Preserves first-seen order of base game title_key -> list of GitHub candidates
+    # Preserves first-seen order of base game title_key -> list of Git repo candidates
     candidates_by_title: dict[str, list[dict]] = {}
 
     in_recompilation = False
@@ -224,24 +320,22 @@ def scan_recompilation_section(
 
         for chunk in split_concatenated_entries(line):
             urls = [u.rstrip(".,;:") for u in ANY_URL_RE.findall(chunk)]
-            gh_match = next(
-                (GITHUB_REPO_RE.match(u) for u in urls if GITHUB_REPO_RE.match(u)),
+            parsed_repo = next(
+                (parse_repo_url(u) for u in urls if parse_repo_url(u)),
                 None,
             )
 
             raw_game_title = extract_game_title(chunk, fallback=chunk)
             display_title = format_titled_game_name(raw_game_title, locations)
 
-            if not gh_match:
+            if not parsed_repo:
                 first_link = urls[0] if urls else "(no link)"
                 unmatched_entries.append((display_title, first_link))
                 if debug:
                     print(f"[DEBUG L{line_no}] UNMATCHED: '{display_title}' -> {first_link}")
                 continue
 
-            owner = gh_match.group(1)
-            repo = gh_match.group(2)
-            matched_url = gh_match.group(0)
+            origin, host, kind, owner, repo, matched_url = parsed_repo
             title = format_titled_game_name(
                 extract_game_title(chunk, fallback=repo), locations
             )
@@ -251,6 +345,9 @@ def scan_recompilation_section(
                 {
                     "line_no": line_no,
                     "title": title,
+                    "origin": origin,
+                    "host": host,
+                    "kind": kind,
                     "owner": owner,
                     "repo": repo,
                     "repo_key": repo_key(owner, repo),
@@ -264,7 +361,7 @@ def scan_recompilation_section(
     used_urls: set[str] = set(reserved_urls or ())
 
     for tk, occs in candidates_by_title.items():
-        # Deduplicate identical GitHub target (repo_key + norm_url) for the same game
+        # Deduplicate identical Git target (repo_key + norm_url) for the same game
         distinct_occs = []
         seen_targets = set()
         for occ in occs:
@@ -273,7 +370,7 @@ def scan_recompilation_section(
                 if debug:
                     print(
                         f"[DEBUG L{occ['line_no']}] DUPLICATE TARGET SKIPPED for '{occ['title']}': "
-                        f"{occ['owner']}/{occ['repo']}"
+                        f"{occ['url']}"
                     )
                 continue
             seen_targets.add(target)
@@ -287,10 +384,17 @@ def scan_recompilation_section(
             for part_idx, occ in enumerate(distinct_occs, start=1):
                 part_title = f"{occ['title']} [PART {part_idx}]"
                 adj_owner, adj_repo, adj_url = unique_case_tweaked_target(
-                    occ["owner"], occ["repo"], used_urls
+                    occ["owner"], occ["repo"], used_urls, origin=occ["origin"]
                 )
                 projects.append(
-                    make_project_entry(adj_owner, adj_repo, part_title, adj_url)
+                    make_project_entry(
+                        adj_owner,
+                        adj_repo,
+                        part_title,
+                        adj_url,
+                        host=occ["host"],
+                        kind=occ["kind"],
+                    )
                 )
                 part_entries.append(
                     {
@@ -305,7 +409,7 @@ def scan_recompilation_section(
                 if debug:
                     print(
                         f"[DEBUG L{occ['line_no']}] CONFLICT PART {part_idx}: "
-                        f"'{part_title}' -> {adj_owner}/{adj_repo} ({adj_url})"
+                        f"'{part_title}' -> {adj_owner}/{adj_repo} ({adj_url}) [{occ['kind']}]"
                     )
 
             conflicting_github_games.append(
@@ -318,15 +422,22 @@ def scan_recompilation_section(
         else:
             only_occ = distinct_occs[0]
             adj_owner, adj_repo, adj_url = unique_case_tweaked_target(
-                only_occ["owner"], only_occ["repo"], used_urls
+                only_occ["owner"], only_occ["repo"], used_urls, origin=only_occ["origin"]
             )
             projects.append(
-                make_project_entry(adj_owner, adj_repo, only_occ["title"], adj_url)
+                make_project_entry(
+                    adj_owner,
+                    adj_repo,
+                    only_occ["title"],
+                    adj_url,
+                    host=only_occ["host"],
+                    kind=only_occ["kind"],
+                )
             )
             if debug:
                 print(
                     f"[DEBUG L{only_occ['line_no']}] MATCHED: "
-                    f"'{only_occ['title']}' -> {adj_owner}/{adj_repo} ({adj_url})"
+                    f"'{only_occ['title']}' -> {adj_owner}/{adj_repo} ({adj_url}) [{only_occ['kind']}]"
                 )
 
     return {
@@ -341,7 +452,7 @@ def print_scan_report(scan_result: dict) -> None:
     conflicts = scan_result.get("conflicting_github_games") or []
 
     print("\n--- Recompilation Scan Report ---")
-    print(f"Matched GitHub projects: {len(scan_result['projects'])}")
+    print(f"Matched Git projects: {len(scan_result['projects'])}")
 
     print(f"\nUnmatched ({len(unmatched)}):")
     if unmatched:
@@ -350,14 +461,14 @@ def print_scan_report(scan_result: dict) -> None:
     else:
         print("  (none)")
 
-    print(f"\nConflicting GitHub links ({len(conflicts)}):")
+    print(f"\nConflicting Git links ({len(conflicts)}):")
     if conflicts:
         for item in conflicts:
             print(f"  - {item['title']} (split into {len(item['occurrences'])} parts)")
             for occ in item["occurrences"]:
                 print(
                     f"      * [PART {occ['part_number']}] L{occ['line_no']}: "
-                    f"{occ['owner']}/{occ['repo']} ({occ['url']})"
+                    f"{occ['owner']}/{occ['repo']} ({occ['url']}) [{occ['kind']}]"
                 )
     else:
         print("  (none)")
@@ -388,7 +499,8 @@ def _existing_urls(projects: list[dict]) -> set[str]:
         if raw_url:
             urls.add(raw_url)
         elif p.get("owner") and p.get("repo"):
-            urls.add(f"https://github.com/{p['owner']}/{p['repo']}")
+            origin = infer_origin_from_html_url(p.get("html_url"))
+            urls.add(f"{origin}/{p['owner']}/{p['repo']}")
     return urls
 
 
@@ -424,13 +536,45 @@ def plan_partial_update(
         new_rk = repo_key(new_proj.get("owner", ""), new_proj.get("repo", ""))
         old_url = normalize_url(proj.get("html_url") or "")
         new_url = normalize_url(new_proj.get("html_url") or "")
+        old_host = (proj.get("host") or "").lower()
+        new_host = (new_proj.get("host") or "").lower()
+        old_kind = (proj.get("kind") or "").lower()
+        new_kind = (new_proj.get("kind") or "").lower()
 
         entry = dict(proj)
-        if old_rk != new_rk or old_url != new_url:
+
+        # Only add host/kind for non-GitHub projects; strip if a GitHub entry had them added
+        if new_kind == "github":
+            entry.pop("host", None)
+            entry.pop("kind", None)
+        else:
+            if not entry.get("host") and new_host:
+                entry["host"] = new_proj["host"]
+            if not entry.get("kind") and new_kind:
+                entry["kind"] = new_proj["kind"]
+
+        if (
+            old_rk != new_rk
+            or old_url != new_url
+            or (new_kind != "github" and new_host and old_host != new_host)
+            or (new_kind != "github" and new_kind and old_kind != new_kind)
+        ):
             entry["owner"] = new_proj["owner"]
             entry["repo"] = new_proj["repo"]
+            if new_kind != "github":
+                entry["host"] = new_proj["host"]
+                entry["kind"] = new_proj["kind"]
+            else:
+                entry.pop("host", None)
+                entry.pop("kind", None)
             entry["title"] = new_proj["title"]
             entry["html_url"] = new_proj["html_url"]
+            entry["description"] = new_proj.get("description", "")
+            entry["latest"] = dict(new_proj["latest"])
+            entry["seen_id"] = new_proj.get("seen_id", "")
+            entry["seen_tag"] = new_proj.get("seen_tag", "")
+            entry["last_checked"] = new_proj.get("last_checked", "")
+            entry["error"] = new_proj.get("error", None)
             replaced_projects.append((proj, entry))
 
         updated_projects.append(entry)
@@ -438,8 +582,12 @@ def plan_partial_update(
     added_projects = []
     for tk, proj in extracted_by_title.items():
         if tk not in matched_title_keys:
+            origin = infer_origin_from_html_url(proj.get("html_url"))
             adj_owner, adj_repo, adj_url = unique_case_tweaked_target(
-                proj.get("owner", ""), proj.get("repo", ""), used_urls
+                proj.get("owner", ""),
+                proj.get("repo", ""),
+                used_urls,
+                origin=origin,
             )
             added_entry = dict(proj)
             added_entry["owner"] = adj_owner
@@ -466,18 +614,23 @@ def confirm_write(output_path: str, plan: dict) -> bool:
 
     print(f"  + Add ({len(added)}):")
     for p in added:
-        print(f"      {p.get('title')} ({p.get('owner')}/{p.get('repo')})")
+        extra = f" @ {p['host']} [{p['kind']}]" if p.get("kind") else ""
+        print(f"      {p.get('title')} ({p.get('owner')}/{p.get('repo')}{extra})")
 
     print(f"  - Remove ({len(removed)}):")
     for p in removed:
-        print(f"      {p.get('title')} ({p.get('owner')}/{p.get('repo')})")
+        extra = f" @ {p['host']} [{p['kind']}]" if p.get("kind") else ""
+        print(f"      {p.get('title')} ({p.get('owner')}/{p.get('repo')}{extra})")
 
     print(f"  ~ Replace ({len(replaced)}):")
     for old_p, new_p in replaced:
         final_title = new_p.get("title") or old_p.get("title")
+        old_kind_str = f" [{old_p['kind']}]" if old_p.get("kind") else ""
+        new_kind_str = f" [{new_p['kind']}]" if new_p.get("kind") else ""
         print(
             f"      [{final_title}] "
-            f"{old_p.get('owner')}/{old_p.get('repo')} -> {new_p.get('owner')}/{new_p.get('repo')}"
+            f"{old_p.get('owner')}/{old_p.get('repo')}{old_kind_str} -> "
+            f"{new_p.get('owner')}/{new_p.get('repo')}{new_kind_str}"
         )
 
     if not added and not removed and not replaced:
