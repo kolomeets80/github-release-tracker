@@ -51,12 +51,12 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "GitHub Release Tracker"
 # Keep in step with the release tag: tag v1.1.1 <-> APP_VERSION "1.1.1" (build.bat checks the format).
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.5.0"
 APP_ID = "santosasarno-code.GitHubReleaseTracker"  # Windows taskbar identity (so the taskbar shows our icon)
 REPO_URL = "https://github.com/santosasarno-code/github-release-tracker"
 NO_DESCRIPTION = "No description, website, or topics provided."  # same wording GitHub shows for an empty About box
 API = "https://api.github.com"
-MAX_PROJECTS = 500
+MAX_PROJECTS = 2000
 MAX_IMPORT_BYTES = 5 * 1024 * 1024
 MAX_CUSTOM_NAME = 80
 
@@ -285,6 +285,14 @@ class RateLimitError(GitHubError):
     pass
 
 
+class NetworkError(GitHubError):
+    """The server could not be reached at all (DNS, refused, timeout, certificate)."""
+
+
+class NoReleasesError(GitHubError):
+    pass
+
+
 # Remaining API calls reported by the last response (None = unknown).
 last_rate_remaining = None
 
@@ -502,6 +510,218 @@ def get_latest(owner, repo, token="", include_prereleases=True):
     return fetch_latest_release(owner, repo, token, include_prereleases)
 
 
+# --------------------------------------------------------------------------
+# Other hosts: GitLab, Gitea / Forgejo (Codeberg) and self-hosted servers.
+# Public repositories only, no token, official releases only (not bare tags).
+# A GitHub project has no "host" / "kind" keys, so GitHub-only files stay as they were.
+# --------------------------------------------------------------------------
+KNOWN_HOSTS = {   # host -> kind ("gitea" also covers Forgejo, which speaks the same API)
+    "gitlab.com": "gitlab",
+    "codeberg.org": "gitea",
+    "gitea.com": "gitea",
+    "code.forgejo.org": "gitea",
+}
+SEG_RE = re.compile(r"^(?!\.+$)[A-Za-z0-9_.-]{1,100}$")
+HOST_RE = re.compile(r"^(?:http://)?[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::\d{1,5})?$")
+KINDS = ("gitlab", "gitea")
+MAX_BODY = 2 * 1024 * 1024
+MAX_PATH_SEGMENTS = 20
+
+
+def host_base(host):
+    """Base URL of a stored host: "codeberg.org" -> https://codeberg.org, "http://x:3000" stays http."""
+    return host if host.startswith("http://") else "https://" + host
+
+
+def host_label(host):
+    return host[len("http://"):] if host.startswith("http://") else host
+
+
+def parse_project_ref(text):
+    """Understand a pasted project reference.
+
+    Returns (host, kind, segments) or None.
+      - host "" = github.com (segments = [owner, repo]);
+      - otherwise host is "example.org" (https) or "http://example.org:3000" (only when typed so);
+      - kind is "gitlab" / "gitea" for known hosts, None for unknown servers (found out later).
+    """
+    text = (text or "").strip()
+    gh = parse_repo(text)
+    if gh:
+        return "", None, [gh[0], gh[1]]
+    m = re.match(r"^(https?)://([^/\s?#]+)([^?#\s]*)", text, re.I)
+    if m:
+        scheme, netloc, path = m.group(1).lower(), m.group(2).lower(), m.group(3)
+    else:   # "codeberg.org/owner/repo" without the scheme
+        m = re.match(r"^((?:[a-z0-9-]+\.)+[a-z0-9-]+(?::\d{1,5})?)/([^?#\s]*)$", text, re.I)
+        if not m:
+            return None
+        scheme, netloc, path = "https", m.group(1).lower(), "/" + m.group(2)
+    if "@" in netloc or netloc in ("github.com", "www.github.com"):
+        return None
+    host = netloc if scheme == "https" else "http://" + netloc
+    if not HOST_RE.match(host):
+        return None
+    kind = KNOWN_HOSTS.get(netloc)
+    path = path.split("/-/")[0]
+    if path.endswith("/-"):
+        path = path[:-2]
+    segs = [x for x in path.split("/") if x]
+    if segs and segs[-1].endswith(".git"):
+        segs[-1] = segs[-1][:-4]
+    if len(segs) < 2 or len(segs) > MAX_PATH_SEGMENTS or not all(SEG_RE.match(x) for x in segs):
+        return None
+    if kind == "gitea":
+        segs = segs[:2]
+    return host, kind, segs
+
+
+def split_path(segs):
+    return "/".join(segs[:-1]), segs[-1]
+
+
+def http_json(url):
+    """GET a public JSON document (no credentials are ever sent)."""
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": "GitHubReleaseTracker",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read(MAX_BODY + 1)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise NotFoundError("Not found (wrong name, or a private repository).")
+        if e.code in (401, 403):
+            raise GitHubError("The server asks for a sign-in (HTTP %d). Only public repositories "
+                              "work, and tokens are not supported for this host." % e.code)
+        if e.code == 429:
+            raise GitHubError("The server is rate-limiting requests (429). Try again later.")
+        raise GitHubError("The server returned HTTP %d." % e.code)
+    except urllib.error.URLError as e:
+        raise NetworkError("Network error: %s" % e.reason)
+    except (TimeoutError, OSError) as e:
+        raise NetworkError("Network error: %s" % e)
+    if len(body) > MAX_BODY:
+        raise GitHubError("The server's answer was too large.")
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise GitHubError("Unexpected answer (not JSON). This does not look like a GitLab or Gitea/Forgejo server.")
+
+
+def _api_url(base, kind, path, tail=""):
+    if kind == "gitea":
+        return "%s/api/v1/repos/%s%s" % (base, "/".join(urllib.parse.quote(x, safe="") for x in path), tail)
+    return "%s/api/v4/projects/%s%s" % (base, urllib.parse.quote("/".join(path), safe=""), tail)
+
+
+def _host_info(base, host, kind, path):
+    d = http_json(_api_url(base, kind, path))
+    if not isinstance(d, dict):
+        raise GitHubError("Unexpected answer from the server.")
+    full = d.get("full_name") if kind == "gitea" else d.get("path_with_namespace")
+    if not (isinstance(full, str) and full):
+        raise NotFoundError("Not found on this server.")
+    parts = full.split("/")
+    if not (2 <= len(parts) <= MAX_PATH_SEGMENTS and all(SEG_RE.match(x) for x in parts)):
+        raise GitHubError("Unexpected project name from the server.")
+    owner, repo = split_path(parts)
+    page = base + "/" + full
+    url = d.get("html_url") if kind == "gitea" else d.get("web_url")
+    return {
+        "owner": owner,
+        "repo": repo,
+        "title": _s(d.get("name"), 200) or repo,
+        "description": _s(d.get("description"), 500),
+        "html_url": safe_url(url, base, page),
+        "host": host,
+        "kind": kind,
+    }
+
+
+def _host_release(base, kind, owner, repo, r):
+    """One release object from the server -> this app's release dict (None if unusable)."""
+    if not isinstance(r, dict) or r.get("draft"):
+        return None
+    tag = _s(r.get("tag_name"), 200)
+    if not tag:
+        return None
+    full = "%s/%s" % (owner, repo)
+    if kind == "gitea":
+        rid = r.get("id") if isinstance(r.get("id"), int) and not isinstance(r.get("id"), bool) else tag
+        when = r.get("published_at") or r.get("created_at") or ""
+        url = r.get("html_url")
+        fallback = "%s/%s/releases/tag/%s" % (base, full, urllib.parse.quote(tag, safe=""))
+        pre = bool(r.get("prerelease"))
+    else:
+        if r.get("upcoming_release"):   # dated in the future: not released yet
+            return None
+        rid, pre = tag, False
+        when = r.get("released_at") or r.get("created_at") or ""
+        links = r.get("_links") if isinstance(r.get("_links"), dict) else {}
+        url = links.get("self")
+        fallback = "%s/%s/-/releases/%s" % (base, full, urllib.parse.quote(tag, safe=""))
+    return {
+        "id": rid,
+        "tag": tag,
+        "name": _s(r.get("name"), 300),
+        "published_at": _s(when, 40),
+        "url": safe_url(url, base, fallback),
+        "prerelease": pre,
+        "source": "release",
+    }
+
+
+def fetch_latest_host(host, kind, owner, repo, include_prereleases=True):
+    """Newest official release of a project on another host, or None if it has none."""
+    base = host_base(host)
+    path = (owner + "/" + repo).split("/")
+    data = http_json(_api_url(base, kind, path, "/releases?%s=10" % ("limit" if kind == "gitea" else "per_page")))
+    if not isinstance(data, list):
+        raise GitHubError("Unexpected answer from the server.")
+    rels = [x for x in (_host_release(base, kind, owner, repo, r) for r in data) if x]
+    if not rels:
+        return None
+    if not include_prereleases:
+        for r in rels:
+            if not r["prerelease"]:
+                return r
+    return rels[0]
+
+
+def resolve_project(host, kind, segs, include_prereleases=True):
+    """Add-time lookup on another host: find out what the server is, check that the project
+    exists and has an official release. Returns (info, latest)."""
+    base = host_base(host)
+    last = None
+    for k in ([kind] if kind else ["gitea", "gitlab"]):
+        path = segs[:2] if k == "gitea" else segs
+        try:
+            info = _host_info(base, host, k, path)
+            latest = fetch_latest_host(host, k, info["owner"], info["repo"], include_prereleases)
+        except NetworkError:
+            raise                      # the server is not reachable: trying another kind will not help
+        except GitHubError as e:
+            last = last or e
+            continue
+        if not latest:
+            raise NoReleasesError("%s has no official releases (only tags, or nothing yet), "
+                                  "so it cannot be tracked." % info["title"])
+        return info, latest
+    if kind or isinstance(last, GitHubError) and not isinstance(last, NotFoundError):
+        raise last
+    raise NotFoundError("Could not find this project on %s. It must be a public repository on a "
+                        "GitLab, Gitea or Forgejo server." % host_label(host))
+
+
+def fetch_latest_for(p_host, p_kind, owner, repo, token, include_prereleases):
+    """Latest release for a GitHub project (host "") or one on another host."""
+    if not p_host:
+        return get_latest(owner, repo, token, include_prereleases)
+    return fetch_latest_host(p_host, p_kind, owner, repo, include_prereleases)
+
+
 def apply_result(p, latest, err, now):
     """Store one check result on project p, without inventing false updates."""
     p["last_checked"] = now
@@ -525,19 +745,67 @@ def apply_result(p, latest, err, now):
 # --------------------------------------------------------------------------
 # Storage, import and export (all input is treated as untrusted)
 # --------------------------------------------------------------------------
-NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+NAME_RE = re.compile(r"^(?!\.+$)[A-Za-z0-9_.-]{1,100}$")   # no "." / ".." (path tricks)
 
 
 def _s(value, limit=300):
     return value.strip()[:limit] if isinstance(value, str) else ""
 
 
-def safe_github_url(url, fallback):
-    """Only ever open https://github.com/... links, whatever a JSON file says."""
-    if (isinstance(url, str) and url.startswith("https://github.com/") and len(url) < 500
+def safe_url(url, base, fallback):
+    """Only ever open links that live on the project's own host, whatever a JSON file says."""
+    if (isinstance(url, str) and url.startswith(base + "/") and len(url) < 500
             and not any(c.isspace() for c in url)):
         return url
     return fallback
+
+
+def safe_github_url(url, fallback):
+    return safe_url(url, "https://github.com", fallback)
+
+
+def project_base(p):
+    return host_base(p["host"]) if p.get("host") else "https://github.com"
+
+
+def repo_page(p):
+    return "%s/%s/%s" % (project_base(p), p["owner"], p["repo"])
+
+
+def release_page(p):
+    """The page listing the project's releases (used when no exact release link is known)."""
+    tail = "/-/releases" if p.get("kind") == "gitlab" else "/releases"
+    return repo_page(p) + tail
+
+
+def repo_label(p):
+    """The full address (host first for other servers); used by the search box."""
+    full = "%s/%s" % (p["owner"], p["repo"])
+    return "%s/%s" % (host_label(p["host"]), full) if p.get("host") else full
+
+
+def repo_path(p):
+    """What the Repository column shows: owner/repo (the host is in the Source column)."""
+    return "%s/%s" % (p["owner"], p["repo"])
+
+
+# Known hosts get a friendly name in the Source column; any other server shows its own address.
+SOURCE_NAMES = {"github.com": "GitHub", "gitlab.com": "GitLab", "codeberg.org": "Codeberg"}
+_SOURCE_ORDER = ("GitHub", "GitLab", "Codeberg")
+
+
+def source_label(p):
+    """Where the project lives: GitHub, GitLab, Codeberg, or the server's address."""
+    host = p.get("host")
+    if not host:
+        return "GitHub"
+    shown = host_label(host)
+    return SOURCE_NAMES.get(shown.lower(), shown)
+
+
+def _source_key(p):
+    name = source_label(p)
+    return (_SOURCE_ORDER.index(name) if name in _SOURCE_ORDER else len(_SOURCE_ORDER), name.casefold())
 
 
 def _id_value(value):
@@ -546,7 +814,7 @@ def _id_value(value):
     return value[:300] if isinstance(value, str) else value
 
 
-def normalize_release(r, owner, repo):
+def normalize_release(r, base, fallback):
     if not isinstance(r, dict):
         return None
     tag = _s(r.get("tag"), 200)
@@ -561,7 +829,7 @@ def normalize_release(r, owner, repo):
         "tag": tag,
         "name": _s(r.get("name"), 300),
         "published_at": _s(r.get("published_at"), 40),
-        "url": safe_github_url(r.get("url"), "https://github.com/%s/%s/releases" % (owner, repo)),
+        "url": safe_url(r.get("url"), base, fallback),
         "prerelease": bool(r.get("prerelease")),
         "source": source if source in ("release", "tag", "feed") else "release",
     }
@@ -582,31 +850,50 @@ def display_name(p):
 def normalize_project(raw):
     """Return a clean project dict from untrusted input, or None if unusable."""
     if isinstance(raw, str):
-        parsed = parse_repo(raw)
-        if not parsed:
+        ref = parse_project_ref(raw)
+        if not ref or (ref[0] and not ref[1]):   # an unknown server cannot be identified offline
             return None
-        raw = {"owner": parsed[0], "repo": parsed[1]}
+        owner, repo = split_path(ref[2])
+        raw = {"owner": owner, "repo": repo}
+        if ref[0]:
+            raw["host"], raw["kind"] = ref[0], ref[1]
     if not isinstance(raw, dict):
         return None
     owner, repo = raw.get("owner"), raw.get("repo")
-    if not (isinstance(owner, str) and isinstance(repo, str)
-            and NAME_RE.match(owner) and NAME_RE.match(repo)):
+    host, kind = raw.get("host"), raw.get("kind")
+    if host in (None, "", "github.com"):
+        host = kind = None
+        ok = (isinstance(owner, str) and isinstance(repo, str)
+              and NAME_RE.match(owner) and NAME_RE.match(repo))
+    else:
+        host = host.lower() if isinstance(host, str) else ""
+        ok = (HOST_RE.match(host) is not None and kind in KINDS and isinstance(owner, str)
+              and isinstance(repo, str) and bool(NAME_RE.match(repo))
+              and 1 <= len(owner.split("/")) < MAX_PATH_SEGMENTS
+              and all(SEG_RE.match(x) for x in owner.split("/")))
+    if not ok:
         return None
+    ref = {"owner": owner, "repo": repo, "host": host, "kind": kind}
+    base = project_base(ref)
     fmt = raw.get("fmt")
     out = {
         "owner": owner,
         "repo": repo,
+    }
+    if host:   # only projects on other hosts carry these keys
+        out["host"], out["kind"] = host, kind
+    out.update({
         "title": _s(raw.get("title"), 200) or repo,
         "description": _s(raw.get("description"), 500),
-        "html_url": safe_github_url(raw.get("html_url"), "https://github.com/%s/%s" % (owner, repo)),
+        "html_url": safe_url(raw.get("html_url"), base, repo_page(ref)),
         "include_prereleases": bool(raw.get("include_prereleases", True)),
         "fmt": fmt if fmt == 2 else None,
-        "latest": normalize_release(raw.get("latest"), owner, repo),
+        "latest": normalize_release(raw.get("latest"), base, release_page(ref)),
         "seen_id": _id_value(raw.get("seen_id")),
         "seen_tag": _s(raw.get("seen_tag"), 200) or None,
         "last_checked": _s(raw.get("last_checked"), 40),
         "error": _s(raw.get("error"), 300) or None,
-    }
+    })
     custom = clean_name(raw.get("custom_name"))
     if custom:  # only present when the user renamed the project
         out["custom_name"] = custom
@@ -656,7 +943,7 @@ def build_export(projects):
     }
 
 
-SORTABLE = ("name", "repo", "published", "status")  # columns whose header can be clicked
+SORTABLE = ("name", "repo", "source", "published", "status")  # columns whose header can be clicked
 
 
 def _title_key(p):
@@ -687,7 +974,13 @@ def sort_projects(projects, col, asc):
     if col == "name":
         return sorted(projects, key=lambda p: (_title_key(p), project_key(p)), reverse=not asc)
     if col == "repo":
-        return sorted(projects, key=project_key, reverse=not asc)
+        # what the column shows (owner/repo); the full key only breaks ties
+        return sorted(projects, key=lambda p: (repo_path(p).lower(), project_key(p)), reverse=not asc)
+    if col == "source":
+        # GitHub, GitLab, Codeberg, then other servers A-Z. Same source: A-Z by name in either
+        # direction (the second sort is stable, so the name order is kept).
+        by_name = sorted(projects, key=lambda p: (_title_key(p), project_key(p)))
+        return sorted(by_name, key=_source_key, reverse=not asc)
     if col == "published":
         dated = [p for p in projects if (p.get("latest") or {}).get("published_at")]
         undated = [p for p in projects if not (p.get("latest") or {}).get("published_at")]
@@ -741,7 +1034,9 @@ def save_data(data):
 
 
 def project_key(p):
-    return ("%s/%s" % (p["owner"], p["repo"]))
+    if p.get("host"):
+        return ("%s/%s/%s" % (host_label(p["host"]), p["owner"], p["repo"])).lower()
+    return ("%s/%s" % (p["owner"], p["repo"])).lower()
 
 
 def has_update(p):
@@ -760,6 +1055,42 @@ def status_text(p):
         new = latest.get("tag") or latest.get("name") or "new release"
         return "Update available: %s -> %s" % (old, new) if old else "Update available: " + new
     return "Up to date"
+
+
+def status_kind(p):
+    """'error', 'update', 'none' (no releases) or 'ok': the same split that colors the rows."""
+    if p.get("error"):
+        return "error"
+    if has_update(p):
+        return "update"
+    if not p.get("latest"):
+        return "none"
+    return "ok"
+
+
+# Choices of the status filter (value, menu text). "all" shows everything.
+STATUS_FILTERS = [("all", "All projects"), ("update", "Updates available"), ("error", "Errors"),
+                  ("ok", "Up to date"), ("none", "No releases")]
+
+
+def filter_projects(projects, query="", kind="all"):
+    """The projects that match the search text and the status filter, in the same order.
+
+    Every word of the search text must appear (any case) in the project name or in the
+    repository address, so "emu rom" finds "Emu Roms" and "owner/emu-roms". Nothing is
+    changed; this only decides what is shown.
+    """
+    terms = (query or "").casefold().split()
+    out = []
+    for p in projects:
+        if kind != "all" and status_kind(p) != kind:
+            continue
+        if terms:
+            hay = ("%s %s %s" % (display_name(p), repo_label(p), source_label(p))).casefold()
+            if not all(t in hay for t in terms):
+                continue
+        out.append(p)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -935,7 +1266,7 @@ class App(tk.Tk):
 
         top = ttk.Frame(self, padding=(10, 10, 10, 4))
         top.pack(fill="x")
-        ttk.Label(top, text="GitHub project (URL or owner/repo):").pack(side="left")
+        ttk.Label(top, text="Project (repo URL or owner/repo):").pack(side="left")
         self.entry = ttk.Entry(top)
         self.entry.pack(side="left", fill="x", expand=True, padx=8)
         self.entry.bind("<Return>", lambda e: self.add_project())
@@ -945,7 +1276,7 @@ class App(tk.Tk):
         bar = ttk.Frame(self, padding=(10, 4, 10, 6))
         bar.pack(fill="x")
         self.toolbar = bar
-        self.btn_check = self._button(bar, "Check for updates", "refresh", self.check_updates)
+        self.btn_check = self._button(bar, "Check for updates", "refresh", self.check_updates_all)
         self.btn_check.pack(side="left")
         self._button(bar, "Mark as seen", "check", self.mark_seen).pack(side="left", padx=(8, 0))
         self._button(bar, "Open release page", "ext", self.open_release).pack(side="left", padx=(8, 0))
@@ -954,13 +1285,39 @@ class App(tk.Tk):
         self._button(bar, "Export", "export", self.export_json).pack(side="right", padx=(0, 8))
         self._button(bar, "Import", "import", self.import_json).pack(side="right", padx=(0, 8))
 
+        # Search + status filter: only changes what is listed, never the saved data.
+        flt = ttk.Frame(self, padding=(10, 0, 10, 6))
+        flt.pack(fill="x")
+        ttk.Label(flt, text="Filter:").pack(side="left")
+        self.filter_text = tk.StringVar()
+        self.filter_kind = tk.StringVar(value="all")
+        self.filter_entry = ttk.Entry(flt, textvariable=self.filter_text)
+        self.filter_entry.pack(side="left", fill="x", expand=True, padx=8)
+        self.filter_entry.bind("<Escape>", lambda e: self.clear_filter())
+        self.filter_text.trace_add("write", lambda *a: self._schedule_filter())
+        self.kind_label = tk.StringVar(value="Show: All projects")
+        self.kind_button = ttk.Menubutton(flt, textvariable=self.kind_label, width=24)
+        self.kind_menu = tk.Menu(self.kind_button, tearoff=0)
+        for value, text in STATUS_FILTERS:
+            self.kind_menu.add_radiobutton(label=text, value=value, variable=self.filter_kind,
+                                           command=self._kind_changed)
+        self.kind_button["menu"] = self.kind_menu
+        self.kind_button.pack(side="left")
+        self.btn_clear = ttk.Button(flt, text="Clear", command=self.clear_filter)
+        self.btn_clear.pack(side="left", padx=(8, 0))
+        self.count_var = tk.StringVar()
+        ttk.Label(flt, textvariable=self.count_var, style="Sub.TLabel", width=14, anchor="e").pack(side="left", padx=(8, 0))
+        self.bind("<Control-f>", lambda e: self._focus_filter())
+        self.bind("<Control-F>", lambda e: self._focus_filter())
+
         frame = ttk.Frame(self, padding=(10, 0, 10, 0))
         frame.pack(fill="both", expand=True)
-        cols = ("name", "repo", "release", "published", "status", "checked")
+        cols = ("name", "repo", "source", "release", "published", "status", "checked")
         self.tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
         heads = [
             ("name", "Project", 230, 120),
-            ("repo", "Repository", 280, 120),
+            ("repo", "Repository", 250, 120),
+            ("source", "Source", 125, 95),         # wide enough for the sort arrow
             ("release", "Current release", 150, 90),
             ("published", "Published", 125, 115),  # wide enough for the sort arrow
             ("status", "Status", 260, 120),
@@ -993,6 +1350,8 @@ class App(tk.Tk):
         self.tree.bind("<Button-3>", self._popup)
         self.tree.bind("<Delete>", lambda e: self.remove_selected())
         self.tree.bind("<F2>", lambda e: self.rename_selected())
+        self.tree.bind("<Control-a>", lambda e: self._select_all_rows())
+        self.tree.bind("<Control-A>", lambda e: self._select_all_rows())
         self.tree.bind("<Button-1>", self._on_tree_click, add="+")
         self.tree.bind("<Configure>", lambda e: self._schedule_lines(delay=40), add="+")
         self.tree.bind("<Configure>", self._layout_columns, add="+")
@@ -1061,6 +1420,9 @@ class App(tk.Tk):
               foreground=[("disabled", c["sub_fg"])])
         s.configure("TEntry", fieldbackground=c["field"], foreground=c["fg"], insertcolor=c["fg"],
                     bordercolor=c["border"], lightcolor=c["field"], darkcolor=c["field"])
+        s.configure("TMenubutton", background=c["btn_bg"], foreground=c["fg"], bordercolor=c["border"],
+                    lightcolor=c["btn_bg"], darkcolor=c["btn_bg"], arrowcolor=c["fg"], padding=(8, 4))
+        s.map("TMenubutton", background=[("active", c["btn_active"])])
         s.configure("TCheckbutton", background=c["bg"], foreground=c["fg"])
         s.map("TCheckbutton", background=[("active", c["bg"])])
         s.configure("Treeview", background=c["field"], fieldbackground=c["field"], foreground=c["fg"],
@@ -1077,7 +1439,7 @@ class App(tk.Tk):
         self.tree.tag_configure("update", background=c["update_bg"], foreground=c["update_fg"])
         self.tree.tag_configure("error", foreground=c["error_fg"])
         self.tree.tag_configure("none", foreground=c["none_fg"])
-        for mnu in (self.menu, self.edit_menu, self.status_menu):
+        for mnu in (self.menu, self.edit_menu, self.status_menu, self.kind_menu):
             mnu.configure(bg=c["field"], fg=c["fg"], activebackground=c["sel_bg"],
                           activeforeground=c["sel_fg"], disabledforeground=c["none_fg"], bd=0)
         self.refresh_icons()
@@ -1460,6 +1822,7 @@ class App(tk.Tk):
         self.status_menu = tk.Menu(self, tearoff=0)
         self.status_menu.add_command(label="Copy", command=self.copy_status)
         self.attach_edit_menu(self.entry)
+        self.attach_edit_menu(self.filter_entry)
         self.status_label.bind("<Button-3>", self._show_status_menu)
 
     def attach_edit_menu(self, entry, masked=False):
@@ -1590,6 +1953,44 @@ class App(tk.Tk):
         self.update_headings()
         self.render()
 
+    # ---- search / filter ---------------------------------------------------
+    def _schedule_filter(self):
+        """Re-list shortly after the last keystroke (400+ rows are rebuilt each time)."""
+        if getattr(self, "_filter_job", None):
+            self.after_cancel(self._filter_job)
+        self._filter_job = self.after(150, self._apply_filter)
+
+    def _apply_filter(self):
+        self._filter_job = None
+        self.render()
+
+    def _kind_changed(self):
+        text = dict(STATUS_FILTERS)[self.filter_kind.get()]
+        self.kind_label.set("Show: " + text)
+        self.render()
+
+    def clear_filter(self):
+        self.filter_text.set("")
+        self.filter_kind.set("all")
+        self.kind_label.set("Show: " + dict(STATUS_FILTERS)["all"])
+        if getattr(self, "_filter_job", None):
+            self.after_cancel(self._filter_job)
+            self._filter_job = None
+        self.render()
+
+    def _focus_filter(self):
+        self.filter_entry.focus_set()
+        self.filter_entry.selection_range(0, "end")
+        return "break"
+
+    def _select_all_rows(self):
+        """Ctrl+A in the list: select every project that is listed (a filter limits it)."""
+        self.tree.selection_set(self.tree.get_children())
+        return "break"
+
+    def filter_active(self):
+        return bool(self.filter_text.get().strip()) or self.filter_kind.get() != "all"
+
     # ---- rendering -------------------------------------------------------
     def render(self):
         self._close_editor(True)  # rows are rebuilt below: save a name being typed first
@@ -1601,7 +2002,11 @@ class App(tk.Tk):
         self.after_idle(self._allow_select)
         selected = set(self.tree.selection())
         self.tree.delete(*self.tree.get_children())
-        projects = sort_projects(self.data["projects"], self.sort_col, self.sort_asc)
+        total = len(self.data["projects"])
+        projects = sort_projects(filter_projects(self.data["projects"], self.filter_text.get(),
+                                                 self.filter_kind.get()), self.sort_col, self.sort_asc)
+        self.count_var.set("%d of %d" % (len(projects), total) if len(projects) != total
+                           else "%d project%s" % (total, "" if total == 1 else "s"))
         for p in projects:
             latest = p.get("latest") or {}
             release = latest.get("tag") or latest.get("name") or ""
@@ -1609,18 +2014,13 @@ class App(tk.Tk):
                 release += " (tag)"
             elif latest.get("prerelease"):
                 release += " (pre-release)"
-            if p.get("error"):
-                tag = "error"
-            elif has_update(p):
-                tag = "update"
-            elif not latest:
-                tag = "none"
-            else:
-                tag = ""
+            tag = status_kind(p)
+            tag = "" if tag == "ok" else tag
             checked = (p.get("last_checked") or "")[:16].replace("T", " ")
             self.tree.insert("", "end", iid=project_key(p), tags=(tag,) if tag else (), values=(
                 display_name(p),
-                "%s/%s" % (p["owner"], p["repo"]),
+                repo_path(p),
+                source_label(p),
                 release or "-",
                 (latest.get("published_at") or "")[:10] or "-",
                 status_text(p),
@@ -1678,18 +2078,27 @@ class App(tk.Tk):
     def add_project(self):
         if self.busy:
             return
-        parsed = parse_repo(self.entry.get())
-        if not parsed:
-            messagebox.showerror(APP_NAME, "Enter a GitHub URL such as\nhttps://github.com/owner/repo\nor just owner/repo.")
+        ref = parse_project_ref(self.entry.get())
+        if not ref:
+            messagebox.showerror(APP_NAME, "Enter a project URL such as\nhttps://github.com/owner/repo,\n"
+                                 "https://codeberg.org/owner/repo or https://gitlab.com/group/project\n"
+                                 "(any GitLab, Gitea or Forgejo server works), or just owner/repo for GitHub.")
             return
-        owner, repo = parsed
-        if any(project_key(p) == ("%s/%s" % (owner, repo)) for p in self.data["projects"]):
-            messagebox.showinfo(APP_NAME, "%s/%s is already in the list." % (owner, repo))
+        host, kind, segs = ref
+        owner, repo = split_path(segs)
+        shown = "%s/%s/%s" % (host_label(host), owner, repo) if host else "%s/%s" % (owner, repo)
+        if any(project_key(p) == shown.lower() for p in self.data["projects"]):
+            messagebox.showinfo(APP_NAME, "%s is already in the list." % shown)
+            return
+        if len(self.data["projects"]) >= MAX_PROJECTS:
+            messagebox.showinfo(APP_NAME, "The list is full (%d projects)." % MAX_PROJECTS)
             return
         token = self.token()
-        self.set_busy(True, "Adding %s/%s ..." % (owner, repo))
+        self.set_busy(True, "Adding %s ..." % shown)
 
         def work():
+            if host:   # another host: public repositories only, official releases only
+                return resolve_project(host, kind, segs, True)
             latest = get_latest(owner, repo, token, True)
             try:
                 info = fetch_repo_info(owner, repo, token)
@@ -1727,11 +2136,39 @@ class App(tk.Tk):
         self.data["projects"].append(p)
         self.persist()
         self.entry.delete(0, "end")
-        self.render()
+        if self.filter_active():   # a filtered-out new project would look like it was not added
+            self.clear_filter()
+        else:
+            self.render()
         if latest:
             self.set_status("Added %s - current release %s." % (p["title"], latest["tag"] or latest["name"]))
         else:
             self.set_status("Added %s - it has no published releases yet." % p["title"])
+
+    def check_updates_all(self):
+        if self.busy:
+            return
+        if not self.data["projects"]:
+            self.set_status("Nothing to check - add a project first.")
+            return
+        token = self.token()
+        snapshot = [(p.get("host") or "", p.get("kind"), p["owner"], p["repo"], bool(p.get("include_prereleases")),
+                     project_key(p)) for p in self.data["projects"]]
+        self.set_busy(True, "Checking %d project(s) ..." % len(snapshot))
+
+        def work():
+            out = []
+            for host, kind, owner, repo, inc, key in snapshot:
+                try:
+                    out.append((key, fetch_latest_for(host, kind, owner, repo, token, inc), None))
+                except RateLimitError as e:
+                    out.append((key, None, str(e)))
+                    break  # no point continuing
+                except GitHubError as e:
+                    out.append((key, None, str(e)))
+            return out
+
+        self.run_async(work, self._checked)
 
     def check_updates(self):
         if self.busy:
@@ -1740,16 +2177,15 @@ class App(tk.Tk):
             self.set_status("Nothing to check - add a project first.")
             return
         token = self.token()
-        snapshot = [(p["owner"], p["repo"], bool(p.get("include_prereleases"))) for p in self.selected_projects()]
-        #snapshot = [(p["owner"], p["repo"], bool(p.get("include_prereleases"))) for p in self.data["projects"]]
+        snapshot = [(p.get("host") or "", p.get("kind"), p["owner"], p["repo"], bool(p.get("include_prereleases")),
+                     project_key(p)) for p in self.selected_projects()]
         self.set_busy(True, "Checking %d project(s) ..." % len(snapshot))
 
         def work():
             out = []
-            for owner, repo, inc in snapshot:
-                key = ("%s/%s" % (owner, repo))
+            for host, kind, owner, repo, inc, key in snapshot:
                 try:
-                    out.append((key, get_latest(owner, repo, token, inc), None))
+                    out.append((key, fetch_latest_for(host, kind, owner, repo, token, inc), None))
                 except RateLimitError as e:
                     out.append((key, None, str(e)))
                     break  # no point continuing
@@ -1806,14 +2242,13 @@ class App(tk.Tk):
             self.set_status("Select a project first.")
             return
         p = sel[0]
-        fallback = "https://github.com/%s/%s/releases" % (p["owner"], p["repo"])
-        webbrowser.open(safe_github_url((p.get("latest") or {}).get("url"), fallback))
+        webbrowser.open(safe_url((p.get("latest") or {}).get("url"), project_base(p), release_page(p)))
 
     def open_repo(self):
         sel = self.selected_projects()
         if sel:
             p = sel[0]
-            webbrowser.open(safe_github_url(p.get("html_url"), "https://github.com/%s/%s" % (p["owner"], p["repo"])))
+            webbrowser.open(safe_url(p.get("html_url"), project_base(p), repo_page(p)))
 
     def toggle_prerelease(self):
         sel = self.selected_projects()
@@ -1910,7 +2345,7 @@ class App(tk.Tk):
         body = ttk.Frame(win, padding=14)
         body.pack(fill="both", expand=True)
 
-        ttk.Label(body, text="GitHub personal access token (optional)").grid(row=0, column=0, sticky="w")
+        ttk.Label(body, text="GitHub personal access token (optional, used for github.com only)").grid(row=0, column=0, sticky="w")
         tok = tk.StringVar(value=self.data["settings"].get("token", ""))
         ent = ttk.Entry(body, textvariable=tok, show="*", width=52)
         ent.grid(row=1, column=0, sticky="we", pady=(2, 2))
