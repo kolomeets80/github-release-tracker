@@ -551,12 +551,12 @@ def parse_project_ref(text):
         return "", None, [gh[0], gh[1]]
     m = re.match(r"^(https?)://([^/\s?#]+)([^?#\s]*)", text, re.I)
     if m:
-        scheme, netloc, path = m.group(1).lower(), m.group(2).lower(), m.group(3)
+        scheme, netloc, path = m.group(1), m.group(2), m.group(3)
     else:   # "codeberg.org/owner/repo" without the scheme
         m = re.match(r"^((?:[a-z0-9-]+\.)+[a-z0-9-]+(?::\d{1,5})?)/([^?#\s]*)$", text, re.I)
         if not m:
             return None
-        scheme, netloc, path = "https", m.group(1).lower(), "/" + m.group(2)
+        scheme, netloc, path = "https", m.group(1), "/" + m.group(2)
     if "@" in netloc or netloc in ("github.com", "www.github.com"):
         return None
     host = netloc if scheme == "https" else "http://" + netloc
@@ -800,7 +800,7 @@ def source_label(p):
     if not host:
         return "GitHub"
     shown = host_label(host)
-    return SOURCE_NAMES.get(shown.lower(), shown)
+    return SOURCE_NAMES.get(shown, shown)
 
 
 def _source_key(p):
@@ -866,7 +866,7 @@ def normalize_project(raw):
         ok = (isinstance(owner, str) and isinstance(repo, str)
               and NAME_RE.match(owner) and NAME_RE.match(repo))
     else:
-        host = host.lower() if isinstance(host, str) else ""
+        host = host if isinstance(host, str) else ""
         ok = (HOST_RE.match(host) is not None and kind in KINDS and isinstance(owner, str)
               and isinstance(repo, str) and bool(NAME_RE.match(repo))
               and 1 <= len(owner.split("/")) < MAX_PATH_SEGMENTS
@@ -884,6 +884,7 @@ def normalize_project(raw):
         out["host"], out["kind"] = host, kind
     out.update({
         "title": _s(raw.get("title"), 200) or repo,
+        "category": _s(raw.get("category"), 80),
         "description": _s(raw.get("description"), 500),
         "html_url": safe_url(raw.get("html_url"), base, repo_page(ref)),
         "include_prereleases": bool(raw.get("include_prereleases", True)),
@@ -943,7 +944,7 @@ def build_export(projects):
     }
 
 
-SORTABLE = ("name", "repo", "source", "published", "status")  # columns whose header can be clicked
+SORTABLE = ("name", "category", "repo", "source", "published", "status", "checked")  # columns whose header can be clicked
 
 
 def _title_key(p):
@@ -973,9 +974,15 @@ def sort_projects(projects, col, asc):
         return sorted(projects, key=lambda p: (sign * status_rank(p), _title_key(p), project_key(p)))
     if col == "name":
         return sorted(projects, key=lambda p: (_title_key(p), project_key(p)), reverse=not asc)
+    if col == "category":
+        return sorted(
+            projects,
+            key=lambda p: ((p.get("category") or "").casefold(), _title_key(p), project_key(p)),
+            reverse=not asc,
+        )
     if col == "repo":
         # what the column shows (owner/repo); the full key only breaks ties
-        return sorted(projects, key=lambda p: (repo_path(p).lower(), project_key(p)), reverse=not asc)
+        return sorted(projects, key=lambda p: (repo_path(p), project_key(p)), reverse=not asc)
     if col == "source":
         # GitHub, GitLab, Codeberg, then other servers A-Z. Same source: A-Z by name in either
         # direction (the second sort is stable, so the name order is kept).
@@ -985,6 +992,12 @@ def sort_projects(projects, col, asc):
         dated = [p for p in projects if (p.get("latest") or {}).get("published_at")]
         undated = [p for p in projects if not (p.get("latest") or {}).get("published_at")]
         dated.sort(key=lambda p: (p["latest"]["published_at"], _title_key(p)), reverse=not asc)
+        undated.sort(key=_title_key)
+        return dated + undated
+    if col == "checked":
+        dated = [p for p in projects if p.get("last_checked")]
+        undated = [p for p in projects if not p.get("last_checked")]
+        dated.sort(key=lambda p: (p["last_checked"], _title_key(p)), reverse=not asc)
         undated.sort(key=_title_key)
         return dated + undated
     return sorted(projects, key=lambda p: (not has_update(p), _title_key(p)))
@@ -1035,8 +1048,8 @@ def save_data(data):
 
 def project_key(p):
     if p.get("host"):
-        return ("%s/%s/%s" % (host_label(p["host"]), p["owner"], p["repo"])).lower()
-    return ("%s/%s" % (p["owner"], p["repo"])).lower()
+        return ("%s/%s/%s" % (host_label(p["host"]), p["owner"], p["repo"]))
+    return ("%s/%s" % (p["owner"], p["repo"]))
 
 
 def has_update(p):
@@ -1061,16 +1074,22 @@ def status_kind(p):
     """'error', 'update', 'none' (no releases) or 'ok': the same split that colors the rows."""
     if p.get("error"):
         return "error"
+    if not p.get("latest"):
+        return "error"
     if has_update(p):
         return "update"
     if not p.get("latest"):
         return "none"
+    if not p.get("latest"):
+        return "none"
+    if not p.get("last_checked"):
+        return "never"
     return "ok"
 
 
 # Choices of the status filter (value, menu text). "all" shows everything.
 STATUS_FILTERS = [("all", "All projects"), ("update", "Updates available"), ("error", "Errors"),
-                  ("ok", "Up to date"), ("none", "No releases")]
+                  ("ok", "Up to date"), ("none", "No releases"), ("never", "Not refreshed")]
 
 
 def filter_projects(projects, query="", kind="all"):
@@ -1086,7 +1105,7 @@ def filter_projects(projects, query="", kind="all"):
         if kind != "all" and status_kind(p) != kind:
             continue
         if terms:
-            hay = ("%s %s %s" % (display_name(p), repo_label(p), source_label(p))).casefold()
+            hay = ("%s %s %s %s" % (display_name(p), p.get("category"), repo_label(p), source_label(p))).casefold()
             if not all(t in hay for t in terms):
                 continue
         out.append(p)
@@ -1312,10 +1331,11 @@ class App(tk.Tk):
 
         frame = ttk.Frame(self, padding=(10, 0, 10, 0))
         frame.pack(fill="both", expand=True)
-        cols = ("name", "repo", "source", "release", "published", "status", "checked")
+        cols = ("name", "category", "repo", "source", "release", "published", "status", "checked")
         self.tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
         heads = [
             ("name", "Project", 230, 120),
+            ("category", "Source", 125, 95),
             ("repo", "Repository", 250, 120),
             ("source", "Source", 125, 95),         # wide enough for the sort arrow
             ("release", "Current release", 150, 90),
@@ -2019,6 +2039,7 @@ class App(tk.Tk):
             checked = (p.get("last_checked") or "")[:16].replace("T", " ")
             self.tree.insert("", "end", iid=project_key(p), tags=(tag,) if tag else (), values=(
                 display_name(p),
+                p.get("category"),
                 repo_path(p),
                 source_label(p),
                 release or "-",
@@ -2087,7 +2108,7 @@ class App(tk.Tk):
         host, kind, segs = ref
         owner, repo = split_path(segs)
         shown = "%s/%s/%s" % (host_label(host), owner, repo) if host else "%s/%s" % (owner, repo)
-        if any(project_key(p) == shown.lower() for p in self.data["projects"]):
+        if any(project_key(p) == shown for p in self.data["projects"]):
             messagebox.showinfo(APP_NAME, "%s is already in the list." % shown)
             return
         if len(self.data["projects"]) >= MAX_PROJECTS:
