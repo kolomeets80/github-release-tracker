@@ -1,11 +1,15 @@
+from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 import json
 import re
+import shutil
 import sys
 
 
 ALLOWED_SECTIONS = {
     "recompilation",
+    "decompilation",
 }
 
 SECTION_HEADER_RE = re.compile(
@@ -132,36 +136,48 @@ def default_settings() -> dict:
     }
 
 
+def _flip_case_at(s: str, idx: int) -> str:
+    ch = s[idx]
+    flipped = ch.upper() if ch.islower() else ch.lower()
+    return s[:idx] + flipped + s[idx + 1 :]
+
+
 def unique_case_tweaked_target(
     owner: str,
     repo: str,
     used_urls: set[str],
     origin: str = "https://github.com",
 ) -> tuple[str, str, str]:
-    """Return (owner, repo, html_url) by flipping the next letter on collision."""
+    """Return (owner, repo, html_url) by flipping character casing on collision."""
     base_origin = (origin or "https://github.com").rstrip("/")
     base_url = f"{base_origin}/{owner}/{repo}"
-    normalized_used = {normalize_url(u) for u in used_urls}
 
-    if normalize_url(base_url) not in normalized_used:
+    # Track exact URLs so distinct case variants are both recognized and added
+    if base_url not in used_urls:
         used_urls.add(base_url)
         return owner, repo, base_url
 
-    for i, ch in enumerate(owner):
-        if ch.isalpha():
-            new_owner = owner[:i] + ch.upper() + owner[i + 1 :]
-            url = f"{base_origin}/{new_owner}/{repo}"
-            if normalize_url(url) not in normalized_used:
-                used_urls.add(url)
-                return new_owner, repo, url
+    # Prefer flipping lowercase -> uppercase first, then uppercase -> lowercase
+    for pass_mode in ("lower_to_upper", "upper_to_lower"):
+        for i, ch in enumerate(owner):
+            if (pass_mode == "lower_to_upper" and ch.islower()) or (
+                pass_mode == "upper_to_lower" and ch.isupper()
+            ):
+                new_owner = _flip_case_at(owner, i)
+                url = f"{base_origin}/{new_owner}/{repo}"
+                if url not in used_urls:
+                    used_urls.add(url)
+                    return new_owner, repo, url
 
-    for i, ch in enumerate(repo):
-        if ch.isalpha():
-            new_repo = repo[:i] + ch.upper() + repo[i + 1 :]
-            url = f"{base_origin}/{owner}/{new_repo}"
-            if normalize_url(url) not in normalized_used:
-                used_urls.add(url)
-                return owner, new_repo, url
+        for i, ch in enumerate(repo):
+            if (pass_mode == "lower_to_upper" and ch.islower()) or (
+                pass_mode == "upper_to_lower" and ch.isupper()
+            ):
+                new_repo = _flip_case_at(repo, i)
+                url = f"{base_origin}/{owner}/{new_repo}"
+                if url not in used_urls:
+                    used_urls.add(url)
+                    return owner, new_repo, url
 
     used_urls.add(base_url)
     return owner, repo, base_url
@@ -174,6 +190,7 @@ def make_project_entry(
     html_url: str | None = None,
     host: str | None = None,
     kind: str | None = None,
+    category: str = "",
 ) -> dict:
     resolved_url = html_url or f"https://github.com/{owner}/{repo}"
     parsed_info = parse_repo_url(resolved_url)
@@ -193,6 +210,7 @@ def make_project_entry(
     entry.update(
         {
             "title": title or repo,
+            "category": category,
             "description": "",
             "html_url": resolved_url,
             "include_prereleases": True,
@@ -269,19 +287,13 @@ def load_game_locations(locations_path: str) -> dict[str, str]:
     return game_to_section
 
 
-def format_titled_game_name(game_title: str, game_locations: dict[str, str]) -> str:
-    prefix_section = game_locations.get(title_key(game_title))
-    if not prefix_section:
+def lookup_game_category(game_title: str, game_locations: dict[str, str]) -> str:
+    """Return the section/drive name for game_title without prefixing the title."""
+    section_name = game_locations.get(title_key(game_title))
+    if not section_name:
         base_only = re.sub(r"\s*\[\d{4}\]\s*$", "", game_title).strip()
-        prefix_section = game_locations.get(title_key(base_only))
-
-    if not prefix_section:
-        return game_title
-
-    prefix = f"[{prefix_section}]"
-    if game_title.lower().startswith(prefix.lower()):
-        return game_title
-    return f"{prefix} {game_title}"
+        section_name = game_locations.get(title_key(base_only))
+    return section_name or ""
 
 
 def scan_recompilation_section(
@@ -326,7 +338,8 @@ def scan_recompilation_section(
             )
 
             raw_game_title = extract_game_title(chunk, fallback=chunk)
-            display_title = format_titled_game_name(raw_game_title, locations)
+            category = lookup_game_category(raw_game_title, locations)
+            display_title = raw_game_title
 
             if not parsed_repo:
                 first_link = urls[0] if urls else "(no link)"
@@ -336,15 +349,15 @@ def scan_recompilation_section(
                 continue
 
             origin, host, kind, owner, repo, matched_url = parsed_repo
-            title = format_titled_game_name(
-                extract_game_title(chunk, fallback=repo), locations
-            )
+            title = extract_game_title(chunk, fallback=repo)
+            category = lookup_game_category(title, locations)
             tk = title_key(title)
 
             candidates_by_title.setdefault(tk, []).append(
                 {
                     "line_no": line_no,
                     "title": title,
+                    "category": category,
                     "origin": origin,
                     "host": host,
                     "kind": kind,
@@ -394,6 +407,7 @@ def scan_recompilation_section(
                         adj_url,
                         host=occ["host"],
                         kind=occ["kind"],
+                        category=occ.get("category", ""),
                     )
                 )
                 part_entries.append(
@@ -432,6 +446,7 @@ def scan_recompilation_section(
                     adj_url,
                     host=only_occ["host"],
                     kind=only_occ["kind"],
+                    category=only_occ.get("category", ""),
                 )
             )
             if debug:
@@ -539,7 +554,7 @@ def plan_partial_update(
         old_host = (proj.get("host") or "").lower()
         new_host = (new_proj.get("host") or "").lower()
         old_kind = (proj.get("kind") or "").lower()
-        new_kind = (new_proj.get("kind") or "").lower()
+        new_kind = (new_proj.get("kind") or "github").lower()
 
         entry = dict(proj)
 
@@ -559,8 +574,15 @@ def plan_partial_update(
             or (new_kind != "github" and new_host and old_host != new_host)
             or (new_kind != "github" and new_kind and old_kind != new_kind)
         ):
-            entry["owner"] = new_proj["owner"]
-            entry["repo"] = new_proj["repo"]
+            origin = infer_origin_from_html_url(new_proj.get("html_url"))
+            adj_owner, adj_repo, adj_url = unique_case_tweaked_target(
+                new_proj.get("owner", ""),
+                new_proj.get("repo", ""),
+                used_urls,
+                origin=origin,
+            )
+            entry["owner"] = adj_owner
+            entry["repo"] = adj_repo
             if new_kind != "github":
                 entry["host"] = new_proj["host"]
                 entry["kind"] = new_proj["kind"]
@@ -568,7 +590,8 @@ def plan_partial_update(
                 entry.pop("host", None)
                 entry.pop("kind", None)
             entry["title"] = new_proj["title"]
-            entry["html_url"] = new_proj["html_url"]
+            entry["category"] = new_proj.get("category", "")
+            entry["html_url"] = adj_url
             entry["description"] = new_proj.get("description", "")
             entry["latest"] = dict(new_proj["latest"])
             entry["seen_id"] = new_proj.get("seen_id", "")
@@ -603,6 +626,21 @@ def plan_partial_update(
         "removed": removed_projects,
         "replaced": replaced_projects,
     }
+
+
+def backup_json_file(target_path: str) -> Path | None:
+    """Copy target_path into <target_dir>/backup/<stem>_<YYYYMMDD_HHMMSS><suffix>."""
+    src = Path(target_path)
+    if not src.exists() or not src.is_file():
+        return None
+
+    backup_dir = src.parent / "backup"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = backup_dir / f"{src.stem}_{timestamp}{src.suffix}"
+    shutil.copy2(src, backup_path)
+    return backup_path
 
 
 def confirm_write(output_path: str, plan: dict) -> bool:
@@ -644,6 +682,9 @@ def confirm_write(output_path: str, plan: dict) -> bool:
             .lower()
         )
         if answer in ("y", "yes"):
+            backup_path = backup_json_file(output_path)
+            if backup_path:
+                print(f"Backed up '{output_path}' -> '{backup_path}'.")
             return True
         if answer in ("", "n", "no"):
             return False
